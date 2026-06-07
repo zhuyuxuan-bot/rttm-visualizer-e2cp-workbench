@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download, Subtitles, Github, Plus, Trash2 } from 'lucide-react'
 import { computeDER, type ErrorInterval, type DERMetrics } from './utils'
+import { buildEpisodeProject, type ReviewStatus, type SegmentEvidence, type SegmentType } from './reviewSchema'
 
 type MediaType = 'audio' | 'video'
 
@@ -27,6 +28,38 @@ interface SRTFile {
   subtitles: Subtitle[]
 }
 
+interface CandidateSpeaker {
+  role?: string
+  speaker?: string
+  score?: number
+  raw: unknown
+}
+
+interface CandidateFace {
+  role?: string
+  faceId?: string
+  score?: number
+  raw: unknown
+}
+
+interface CandidateEntry {
+  id: string
+  segmentKey: string
+  start?: number
+  end?: number
+  subtitleText?: string
+  top5Speakers: CandidateSpeaker[]
+  top5Faces: CandidateFace[]
+  raw: unknown
+}
+
+interface CandidateFile {
+  id: string
+  name: string
+  url: string
+  entries: CandidateEntry[]
+}
+
 interface Subtitle {
   id: number
   start: number
@@ -39,6 +72,11 @@ interface Segment {
   speakerId: string
   start: number
   end: number
+  text?: string
+  reviewStatus?: ReviewStatus
+  notes?: string
+  segmentType?: SegmentType
+  evidence?: SegmentEvidence
 }
 
 interface Speaker {
@@ -46,6 +84,7 @@ interface Speaker {
   name: string
   color: string
   visible: boolean
+  source?: 'rttm' | 'manual' | 'candidate'
 }
 
 
@@ -111,7 +150,19 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
     const spk = f[7] || 'spk'
     const end = start + dur
     const id = `${spk}_${start.toFixed(3)}_${end.toFixed(3)}`
-    segs.push({id, speakerId: spk, start, end})
+    segs.push({
+      id,
+      speakerId: spk,
+      start,
+      end,
+      text: '',
+      reviewStatus: 'pending',
+      segmentType: 'dialogue',
+      evidence: {
+        audio: { rttmSpeaker: spk },
+        fusion: { role: spk, strategy: 'rttm' },
+      },
+    })
     if(!speakerIndex.has(spk)){
       const color = colorPalette[colorPtr % colorPalette.length]; colorPtr++
       speakerIndex.set(spk, { id: spk, name: spk, color, visible: true })
@@ -122,12 +173,118 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
   return {segments: segs, speakers}
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function toNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function pickString(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function extractTimesFromKey(key: string): { start?: number; end?: number } {
+  const keyMatch = key.match(/(?:^|_)(\d+(?:\.\d+)?)_(\d+(?:\.\d+)?)$/)
+  if (keyMatch) {
+    return { start: Number(keyMatch[1]), end: Number(keyMatch[2]) }
+  }
+  const rangeMatch = key.match(/(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)/)
+  if (rangeMatch) {
+    return { start: Number(rangeMatch[1]), end: Number(rangeMatch[2]) }
+  }
+  return {}
+}
+
+function normalizeCandidateSpeaker(raw: unknown): CandidateSpeaker {
+  const record = asRecord(raw)
+  if (!record) return { raw }
+  return {
+    role: pickString(record, ['role', 'speaker', 'speaker_id', 'name', 'label']),
+    speaker: pickString(record, ['speaker', 'speaker_id', 'id', 'name']),
+    score: toNumber(record.score ?? record.sim ?? record.similarity ?? record.confidence),
+    raw,
+  }
+}
+
+function inferEpisodeLabel(names: Array<string | undefined>): string {
+  const joined = names.filter(Boolean).join(' ')
+  const epMatch = joined.match(/\b(?:ep|episode)[\s_-]*0?(\d{1,2})\b/i)
+  if (epMatch) return `EP${epMatch[1].padStart(2, '0')}`
+  const numericMatch = joined.match(/(?:^|[^\d])0?(\d{1,2})(?:[._\-\s]|$)/)
+  return numericMatch ? `EP${numericMatch[1].padStart(2, '0')}` : '未识别'
+}
+
+function normalizeCandidateFace(raw: unknown): CandidateFace {
+  const record = asRecord(raw)
+  if (!record) return { raw }
+  return {
+    role: pickString(record, ['role', 'name', 'label']),
+    faceId: pickString(record, ['face_id', 'faceId', 'id']),
+    score: toNumber(record.score ?? record.sim ?? record.similarity ?? record.confidence),
+    raw,
+  }
+}
+
+function parseCandidateJSON(text: string): CandidateEntry[] {
+  const parsed = JSON.parse(text) as unknown
+  const root = asRecord(parsed)
+  const items = Array.isArray(parsed)
+    ? parsed.map((value, index) => [`item_${index + 1}`, value] as const)
+    : root
+      ? Object.entries(root)
+      : []
+
+  return items.flatMap(([key, value], index) => {
+    const record = asRecord(value)
+    if (!record) return []
+    const timeFromKey = extractTimesFromKey(key)
+    const timeRange = pickString(record, ['time_range', 'timeRange', 'range'])
+    const timeFromRange = timeRange ? extractTimesFromKey(timeRange) : {}
+    const start = toNumber(record.start ?? record.start_time ?? record.startTime) ?? timeFromRange.start ?? timeFromKey.start
+    const end = toNumber(record.end ?? record.end_time ?? record.endTime) ?? timeFromRange.end ?? timeFromKey.end
+    const top5SpeakersRaw = record.top_5_speakers ?? record.top5_speakers ?? record.top5Speakers ?? record.speakers
+    const top5FacesRaw = record.top_5_faces ?? record.top5_faces ?? record.top5Faces ?? record.faces
+    return [{
+      id: `${key}_${index}`,
+      segmentKey: key,
+      start,
+      end,
+      subtitleText: pickString(record, ['subtitle_text', 'subtitleText', 'text', 'sentence']),
+      top5Speakers: Array.isArray(top5SpeakersRaw) ? top5SpeakersRaw.map(normalizeCandidateSpeaker) : [],
+      top5Faces: Array.isArray(top5FacesRaw) ? top5FacesRaw.map(normalizeCandidateFace) : [],
+      raw: value,
+    }]
+  })
+}
+
 const sampleVideo = "https://videos.pexels.com/video-files/30333849/13003128_2560_1440_25fps.mp4"
 
 // Load local defaults from exp/ using Vite glob imports
 // RTTM as raw text; media as URLs
 const defaultRttmFiles = import.meta.glob('/exp/rttm/*.rttm', { eager: true, query: '?raw', import: 'default' }) as Record<string, string>
 const defaultMediaFiles = import.meta.glob('/exp/raw/*.{mp4,webm,mp3,wav,m4a}', { eager: true, query: '?url', import: 'default' }) as Record<string, string>
+const defaultSrtFiles = import.meta.glob('/exp/srt/*.srt', { eager: true, query: '?raw', import: 'default' }) as Record<string, string>
+const defaultCandidateFiles = {
+  ...import.meta.glob('/exp/json/**/*.json', { eager: true, query: '?raw', import: 'default' }),
+  ...import.meta.glob('/exp/candidate/**/*.json', { eager: true, query: '?raw', import: 'default' }),
+} as Record<string, string>
+const WAVEFORM_HEIGHT = 148
+const SUBTITLE_TRACK_HEIGHT = 48
+const WAVEFORM_POINTS_PER_SEC = 50
+const WAVEFORM_MAX_CHUNK_WIDTH = 3000
 
 export default function App(){
   const [title] = useState('RTTM Visualizer') // 1) Title updated
@@ -137,9 +294,11 @@ export default function App(){
   const [duration, setDuration] = useState(0)
   const [zoom, setZoom] = useState(1)
   const [media, setMedia] = useState<MediaFile|null>({ id:'sample', name:'sample.mp4', type:'video', url: sampleVideo })
+  const [waveformSource, setWaveformSource] = useState<{url: string; name: string} | null>(null)
   const [rttm, setRTTM] = useState<RTTMFile|null>(null)
   const [refRTTM, setRefRTTM] = useState<RTTMFile|null>(null)
   const [srt, setSRT] = useState<SRTFile|null>(null)
+  const [candidateFile, setCandidateFile] = useState<CandidateFile|null>(null)
   const [segments, setSegments] = useState<Segment[]>([])
   const [refSegments, setRefSegments] = useState<Segment[]>([])
   const [ghostSeg, setGhostSeg] = useState<{speakerId:string; start:number; end:number} | null>(null)
@@ -156,10 +315,69 @@ export default function App(){
   const isScrubbingRef = useRef(false)
   const defaultLoadedRef = useRef(false)
   const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
+  const [newSpeakerName, setNewSpeakerName] = useState('')
+  const [followSubtitle, setFollowSubtitle] = useState(false)
   const dragRef = useRef<{ type: 'start'|'end'|'move'|'create'; speakerId: string; segId?: string; anchorTime?: number } | null>(null)
   const [dragTip, setDragTip] = useState<{x:number;y:number;text:string}|null>(null)
   const segmentsRef = useRef<Segment[]>([])
   useEffect(()=>{ segmentsRef.current = segments }, [segments])
+  const selectedSegment = useMemo(
+    () => segments.find((segment) => segment.id === selectedSegId) ?? null,
+    [segments, selectedSegId],
+  )
+  const selectedSpeaker = useMemo(
+    () => speakers.find((speaker) => speaker.id === selectedSegment?.speakerId) ?? null,
+    [speakers, selectedSegment?.speakerId],
+  )
+  const selectedCandidate = useMemo(() => {
+    if (!selectedSegment || !candidateFile?.entries.length) return null
+    let best: { entry: CandidateEntry; overlap: number } | null = null
+    for (const entry of candidateFile.entries) {
+      if (entry.start === undefined || entry.end === undefined) continue
+      const overlap = Math.min(selectedSegment.end, entry.end) - Math.max(selectedSegment.start, entry.start)
+      const midpoint = (selectedSegment.start + selectedSegment.end) / 2
+      const midpointInside = midpoint >= entry.start && midpoint <= entry.end
+      const score = Math.max(0, overlap) + (midpointInside ? 0.01 : 0)
+      if (score > 0 && (!best || score > best.overlap)) best = { entry, overlap: score }
+    }
+    return best?.entry ?? null
+  }, [candidateFile, selectedSegment])
+  const updateSelectedSegment = useCallback((patch: Partial<Segment>) => {
+    if (!selectedSegId) return
+    setSegments((prev) => prev.map((segment) => (
+      segment.id === selectedSegId
+        ? {
+            ...segment,
+            ...patch,
+            evidence: patch.evidence
+              ? { ...segment.evidence, ...patch.evidence }
+              : segment.evidence,
+          }
+        : segment
+    )))
+  }, [selectedSegId])
+  const markSelectedAsChecked = useCallback(() => {
+    updateSelectedSegment({ reviewStatus: 'checked' })
+  }, [updateSelectedSegment])
+  const addSpeaker = useCallback((name?: string, source: Speaker['source'] = 'manual') => {
+    const trimmed = (name || newSpeakerName || '').trim()
+    const baseName = trimmed || `speaker${speakers.length + 1}`
+    const safeId = baseName
+      .replace(/\s+/g, '_')
+      .replace(/[^\w\u4e00-\u9fa5-]/g, '')
+      || `speaker${speakers.length + 1}`
+    let id = safeId
+    let suffix = 2
+    while (speakers.some((speaker) => speaker.id === id)) {
+      id = `${safeId}_${suffix++}`
+    }
+    const palette = ['#3B82F6','#EF4444','#10B981','#F59E0B','#8B5CF6','#06B6D4','#84CC16','#EC4899','#14B8A6','#F472B6']
+    const color = palette[speakers.length % palette.length]
+    const speaker: Speaker = { id, name: baseName, color, visible: true, source }
+    setSpeakers((prev) => [...prev, speaker])
+    setNewSpeakerName('')
+    return speaker
+  }, [newSpeakerName, speakers])
   const [ctxMenu, setCtxMenu] = useState<{x:number; y:number; segId: string} | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<{open: boolean; segId: string} | null>(null)
   const lastDeletedRef = useRef<Segment | null>(null)
@@ -186,19 +404,38 @@ export default function App(){
   const rttmInputRef = useRef<HTMLInputElement>(null)
   const refRttmInputRef = useRef<HTMLInputElement>(null)
   const srtInputRef = useRef<HTMLInputElement>(null)
+  const candidateInputRef = useRef<HTMLInputElement>(null)
   const onDrop = useCallback((e: React.DragEvent)=>{
     e.preventDefault(); setDragOver(false)
     const files = Array.from(e.dataTransfer.files)
     handleFiles(files)
   },[])
-  function handleFiles(files: File[], target?: 'sys'|'ref'){
+  function handleFiles(files: File[], target?: 'sys'|'ref'|'candidate'){
     for(const f of files){
-      if(f.name.toLowerCase().endsWith('.rttm')){
+      const lowerName = f.name.toLowerCase()
+      if(lowerName.endsWith('.json')){
+        const url = URL.createObjectURL(f)
+        const reader = new FileReader()
+        reader.onload = () => {
+          try {
+            const entries = parseCandidateJSON(String(reader.result))
+            setCandidateFile({ id: crypto.randomUUID(), name: f.name, url, entries })
+            setToast({ message: `已载入候选匹配 JSON：${entries.length} 条` })
+            window.setTimeout(()=>{ setToast(null) }, 3500)
+          } catch (error) {
+            URL.revokeObjectURL(url)
+            setToast({ message: `JSON 解析失败：${error instanceof Error ? error.message : '未知错误'}` })
+            window.setTimeout(()=>{ setToast(null) }, 5000)
+          }
+        }
+        reader.readAsText(f)
+      } else if(lowerName.endsWith('.rttm')){
         const url = URL.createObjectURL(f)
         const reader = new FileReader()
         reader.onload = () => {
           const {segments, speakers} = parseRTTM(String(reader.result))
-          const isRefTarget = (target==='ref') || (/\bref\b/i.test(f.name)) || (!!rttm && !refRTTM)
+          const explicitTarget = target ?? (/\bref\b/i.test(f.name) ? 'ref' : 'sys')
+          const isRefTarget = explicitTarget === 'ref'
           if(isRefTarget){
             setRefSegments(segments)
             setRefRTTM({ id: crypto.randomUUID(), name:f.name, url, matched: true })
@@ -208,7 +445,7 @@ export default function App(){
           }
         }
         reader.readAsText(f)
-      } else if(f.name.toLowerCase().endsWith('.srt')){
+      } else if(lowerName.endsWith('.srt')){
         const url = URL.createObjectURL(f)
         const reader = new FileReader()
         reader.onload = () => {
@@ -220,6 +457,7 @@ export default function App(){
         const url = URL.createObjectURL(f)
         const type: MediaType = /\.(mp4|webm)$/i.test(f.name) ? 'video' : 'audio'
         setMedia({ id: crypto.randomUUID(), name: f.name, type, url, size: f.size })
+        setWaveformSource({ url, name: f.name })
       }
     }
   }
@@ -257,11 +495,12 @@ export default function App(){
 
   const aroundListRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
+    if (!followSubtitle) return
     const el = aroundListRef.current
     if (!el) return
     const currentEl = el.querySelector('.sub-item.current') as HTMLElement | null
     if (currentEl) currentEl.scrollIntoView({ block: 'center' })
-  }, [currentSubtitle?.id])
+  }, [currentSubtitle?.id, followSubtitle])
 
   useEffect(() => {
     if (videoRef.current) {
@@ -294,14 +533,47 @@ export default function App(){
   }, [srt])
   const visibleSubtitles = useMemo(() => {
     const q = subtitleQuery.trim().toLowerCase()
-    if (!q) return allSubtitles
-    return allSubtitles.filter(s => s.text.toLowerCase().includes(q))
-  }, [allSubtitles, subtitleQuery])
+    if (q) return allSubtitles.filter(s => s.text.toLowerCase().includes(q)).slice(0, 250)
+    if (allSubtitles.length <= 80) return allSubtitles
+    const selectedSubtitleIndex = selectedSegment
+      ? allSubtitles.findIndex((sub) => sub.start <= selectedSegment.end && sub.end >= selectedSegment.start)
+      : -1
+    const centerIndex = selectedSubtitleIndex >= 0 ? selectedSubtitleIndex : Math.max(0, currentSubtitleIndex)
+    const startIdx = Math.max(0, centerIndex - 24)
+    const endIdx = Math.min(allSubtitles.length, centerIndex + 36)
+    return allSubtitles.slice(startIdx, endIdx)
+  }, [allSubtitles, currentSubtitleIndex, selectedSegment, subtitleQuery])
+  const sortedSegmentRows = useMemo(
+    () => segments.slice().sort((a, b) => a.start - b.start).map((segment, index) => ({ segment, index })),
+    [segments],
+  )
+  const selectedSegmentRowIndex = useMemo(
+    () => sortedSegmentRows.findIndex((row) => row.segment.id === selectedSegId),
+    [selectedSegId, sortedSegmentRows],
+  )
+  const visibleSegmentRows = useMemo(() => {
+    if (sortedSegmentRows.length <= 140) return sortedSegmentRows
+    const centerIndex = selectedSegmentRowIndex >= 0 ? selectedSegmentRowIndex : 0
+    const startIdx = Math.max(0, centerIndex - 45)
+    const endIdx = Math.min(sortedSegmentRows.length, centerIndex + 75)
+    return sortedSegmentRows.slice(startIdx, endIdx)
+  }, [selectedSegmentRowIndex, sortedSegmentRows])
 
   // right panel auto collapse/expand logic based on data presence
   const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
   const hasRef = useMemo(()=> (!!refRTTM) || refSegments.length>0, [refRTTM, refSegments.length])
   const hasSRT = useMemo(()=> !!srt, [srt])
+  const currentEpisodeLabel = useMemo(
+    () => inferEpisodeLabel([media?.name, rttm?.name, refRTTM?.name, srt?.name, candidateFile?.name]),
+    [media?.name, rttm?.name, refRTTM?.name, srt?.name, candidateFile?.name],
+  )
+  const sourceFileRows = useMemo(() => [
+    { label: 'Media', name: media?.name, detail: media ? formatTime(duration || media.duration || 0) : '必需' },
+    { label: 'RTTM', name: rttm?.name, detail: rttm ? `${segments.length} segments` : '必需' },
+    { label: 'Ref RTTM', name: refRTTM?.name, detail: refRTTM ? `${refSegments.length} ref segments` : '可选' },
+    { label: 'SRT', name: srt?.name, detail: srt ? `${srt.subtitles.length} subtitles` : '建议加载' },
+    { label: 'subseg JSON', name: candidateFile?.name, detail: candidateFile ? `${candidateFile.entries.length} matches` : '建议加载' },
+  ], [candidateFile, duration, media, refRTTM, refSegments.length, rttm, segments.length, srt])
   useEffect(()=>{
     if(!hasRTTM && !hasSRT) setRightCollapsed(true)
     else setRightCollapsed(false)
@@ -339,6 +611,15 @@ export default function App(){
         const name = mp4First.split('/').pop() || 'media'
         const type: MediaType = /\.(mp4|webm)$/i.test(name) ? 'video' : 'audio'
         setMedia({ id: 'default-media', name, type, url })
+        const mediaBase = name.replace(/\.[^/.]+$/, '').toLowerCase()
+        const audioFirst = mediaKeys.find((key) => {
+          const fileName = key.split('/').pop() || ''
+          return /\.(wav|mp3|m4a)$/i.test(fileName) && fileName.replace(/\.[^/.]+$/, '').toLowerCase() === mediaBase
+        }) || mediaKeys.find((key) => /\.(wav|mp3|m4a)$/i.test(key)) || mp4First
+        setWaveformSource({
+          url: defaultMediaFiles[audioFirst],
+          name: audioFirst.split('/').pop() || name,
+        })
       }
       const rttmKeys = Object.keys(defaultRttmFiles).sort()
       if(rttmKeys.length > 0){
@@ -351,6 +632,26 @@ export default function App(){
         const blob = new Blob([content], {type:'text/plain'})
         const url = URL.createObjectURL(blob)
         setRTTM({ id: 'default-rttm', name, url, matched: true })
+      }
+      const srtKeys = Object.keys(defaultSrtFiles).sort()
+      if(srtKeys.length > 0){
+        const firstPath = srtKeys[0]
+        const content = defaultSrtFiles[firstPath]
+        const name = firstPath.split('/').pop() || 'subtitles.srt'
+        const subtitles = parseSRT(content)
+        const blob = new Blob([content], {type:'text/plain'})
+        const url = URL.createObjectURL(blob)
+        setSRT({ id: 'default-srt', name, url, subtitles })
+      }
+      const candidateKeys = Object.keys(defaultCandidateFiles).sort()
+      if(candidateKeys.length > 0){
+        const preferredPath = candidateKeys.find((key) => /subseg|match/i.test(key)) || candidateKeys[0]
+        const content = defaultCandidateFiles[preferredPath]
+        const name = preferredPath.split('/').pop() || 'subseg_match_results.json'
+        const entries = parseCandidateJSON(content)
+        const blob = new Blob([content], {type:'application/json'})
+        const url = URL.createObjectURL(blob)
+        setCandidateFile({ id: 'default-candidate-json', name, url, entries })
       }
     } catch (e) {
       // ignore
@@ -446,11 +747,12 @@ export default function App(){
   const trackCount = speakers.length>0 ? speakers.length : Math.min(4, 10) // 默认最多显示4个空轨道
   const hasRefTrackVisible = showRefTrack && refSegments.length > 0
   const actualTrackCount = trackCount + (hasRefTrackVisible ? 1 : 0)
-  const timelineMinHeight = 24 + 56 + Math.max(2, actualTrackCount) * 28 // ruler + wave + tracks
+  const subtitleTrackHeight = hasSRT ? SUBTITLE_TRACK_HEIGHT : 0
+  const timelineMinHeight = 24 + WAVEFORM_HEIGHT + subtitleTrackHeight + Math.max(2, actualTrackCount) * 28 // ruler + wave + subtitles + tracks
 
   // click timeline seek
   const waveRef = useRef<HTMLDivElement>(null)
-  const waveCanvasRef = useRef<HTMLCanvasElement>(null)
+  const waveChunkRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
   const onClickTimeline = (e: React.MouseEvent) => {
     const el = waveRef.current; if(!el) return
     const rect = el.getBoundingClientRect()
@@ -521,11 +823,22 @@ export default function App(){
     })
   }
 
-  const createSegmentAt = (speakerId: string, atTime: number) => {
+  const createSegmentAt = (speakerId: string, atTime: number, preset?: Partial<Segment>) => {
     const id = crypto.randomUUID()
     const baseStart = atTime
-    const baseEnd = Math.min((duration||atTime+1), atTime + 0.2)
-    const newSeg: Segment = { id, speakerId, start: baseStart, end: baseEnd }
+    const baseEnd = preset?.end ?? Math.min((duration||atTime+1), atTime + 0.2)
+    const newSeg: Segment = {
+      id,
+      speakerId,
+      start: baseStart,
+      end: baseEnd,
+      text: '',
+      reviewStatus: 'inserted',
+      segmentType: 'dialogue',
+      evidence: { text: { source: 'manual', value: '' } },
+      notes: 'Manual inserted segment',
+      ...preset,
+    }
     setSegments(prev => {
       // Prevent overlap on insert by shrinking into nearest gap
       const list = prev.filter(s=>s.speakerId===speakerId).sort((a,b)=>a.start-b.start)
@@ -536,13 +849,35 @@ export default function App(){
         if(s.end <= atTime){ leftBound = Math.max(leftBound, s.end) }
         if(s.start >= atTime && rightBound=== (duration||Number.POSITIVE_INFINITY)){ rightBound = s.start }
       }
-      const start = Math.max(leftBound, Math.min(baseStart, rightBound - MIN_DUR))
-      const end = Math.max(start + MIN_DUR, Math.min(baseEnd, rightBound))
+      const start = Math.max(leftBound, Math.min(newSeg.start, rightBound - MIN_DUR))
+      const end = Math.max(start + MIN_DUR, Math.min(newSeg.end, rightBound))
       const adjusted = {...newSeg, start, end}
       return [...prev, adjusted].sort((a,b)=> a.start-b.start)
     })
     setSelectedSegId(id)
     return id
+  }
+
+  const insertMissingRange = (range: { start: number; end: number }) => {
+    const speakerId = selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'
+    if (!speakers.some((speaker) => speaker.id === speakerId)) {
+      setSpeakers((prev) => [
+        ...prev,
+        { id: speakerId, name: speakerId, color: '#8B5CF6', visible: true },
+      ])
+    }
+    const id = createSegmentAt(speakerId, range.start, {
+      start: range.start,
+      end: Math.max(range.start + MIN_DUR, range.end),
+      reviewStatus: 'inserted',
+      notes: 'Inserted from waveform suspected missing speech',
+      evidence: {
+        text: { source: 'manual', value: '' },
+        waveform: { suspectedMissing: true },
+      },
+    })
+    setSelectedSegId(id)
+    seek(range.start)
   }
 
   // Remove segment with optional undo
@@ -614,11 +949,22 @@ export default function App(){
 
   // export project (segments + speakers) JSON
   const exportJSON = () => {
-    const data = { media, rttm, speakers, segments, refRTTM, refSegments }
+    const data = buildEpisodeProject({
+      media: media ? { ...media, duration } : null,
+      rttm,
+      refRTTM,
+      srt,
+      candidate: candidateFile,
+      speakers,
+      segments,
+      refSegments,
+      missingRanges: waveMissingRanges,
+    })
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'})
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    a.href = url; a.download = 'rttm-project.json'; a.click()
+    const fileId = media?.name ? media.name.replace(/\.[^/.]+$/, '') : 'episode'
+    a.href = url; a.download = `${fileId}_review_project.json`; a.click()
     URL.revokeObjectURL(url)
   }
 
@@ -644,52 +990,207 @@ export default function App(){
   // Waveform generation from media
   const [wavePeaks, setWavePeaks] = useState<Float32Array | null>(null)
   const [waveFailed, setWaveFailed] = useState<boolean>(false)
-   useEffect(() => {
-    setWaveFailed(true); // 直接标记 waveform 不可用
-  }, [media?.url]);
+  const [waveLoading, setWaveLoading] = useState<boolean>(false)
+  const [waveMessage, setWaveMessage] = useState<string>('')
+  useEffect(() => {
+    let cancelled = false
+    const sourceUrl = waveformSource?.url || media?.url
+    if (!sourceUrl) {
+      setWavePeaks(null)
+      setWaveFailed(false)
+      setWaveMessage('')
+      return
+    }
 
-  // Draw waveform on canvas sized to timeline width
+    const loadWaveform = async () => {
+      setWavePeaks(null)
+      setWaveFailed(false)
+      setWaveLoading(true)
+      setWaveMessage('Analyzing waveform...')
+      try {
+        const response = await fetch(sourceUrl)
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const buffer = await response.arrayBuffer()
+        const AudioContextClass = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+        if (!AudioContextClass) throw new Error('Web Audio API is not available')
+        const audioContext = new AudioContextClass()
+        const audioBuffer = await audioContext.decodeAudioData(buffer.slice(0))
+        const channel = audioBuffer.getChannelData(0)
+        const pointsPerSec = WAVEFORM_POINTS_PER_SEC
+        const windowSize = Math.max(1, Math.floor(audioBuffer.sampleRate / pointsPerSec))
+        const peakCount = Math.max(1, Math.ceil(audioBuffer.duration * pointsPerSec))
+        const peaks = new Float32Array(peakCount)
+
+        for (let i = 0; i < peakCount; i++) {
+          let max = 0
+          const start = i * windowSize
+          const end = Math.min(channel.length, start + windowSize)
+          for (let j = start; j < end; j++) {
+            const value = Math.abs(channel[j])
+            if (value > max) max = value
+          }
+          peaks[i] = max
+        }
+
+        await audioContext.close?.()
+        if (cancelled) return
+        setWavePeaks(peaks)
+        setWaveFailed(false)
+        setWaveMessage(`Waveform: ${waveformSource?.name || media?.name || 'media'}`)
+      } catch (error) {
+        if (cancelled) return
+        setWavePeaks(null)
+        setWaveFailed(true)
+        setWaveMessage(error instanceof Error ? error.message : 'Waveform unavailable')
+      } finally {
+        if (!cancelled) setWaveLoading(false)
+      }
+    }
+
+    loadWaveform()
+    return () => {
+      cancelled = true
+    }
+  }, [media?.url, media?.name, waveformSource?.url, waveformSource?.name])
+
+  const waveMissingRanges = useMemo(() => {
+    if (!wavePeaks || wavePeaks.length === 0) return [] as Array<{ start: number; end: number }>
+    const pointsPerSec = WAVEFORM_POINTS_PER_SEC
+    const threshold = 0.035
+    const minDuration = 0.18
+    const mergeGap = 0.2
+    const active: Array<{ start: number; end: number }> = []
+    let rangeStart: number | null = null
+
+    for (let i = 0; i < wavePeaks.length; i++) {
+      const isActive = wavePeaks[i] >= threshold
+      const t = i / pointsPerSec
+      if (isActive && rangeStart === null) rangeStart = t
+      if (!isActive && rangeStart !== null) {
+        active.push({ start: rangeStart, end: t })
+        rangeStart = null
+      }
+    }
+    if (rangeStart !== null) active.push({ start: rangeStart, end: wavePeaks.length / pointsPerSec })
+
+    const merged = active.reduce<Array<{ start: number; end: number }>>((acc, range) => {
+      const last = acc[acc.length - 1]
+      if (last && range.start - last.end <= mergeGap) {
+        last.end = range.end
+      } else {
+        acc.push({ ...range })
+      }
+      return acc
+    }, [])
+
+    const overlaps = (range: { start: number; end: number }, item: { start: number; end: number }) => {
+      const overlap = Math.max(0, Math.min(range.end, item.end) - Math.max(range.start, item.start))
+      const rangeDuration = Math.max(0.001, range.end - range.start)
+      return overlap / rangeDuration
+    }
+
+    return merged
+      .filter((range) => range.end - range.start >= minDuration)
+      .filter((range) => !segments.some((segment) => overlaps(range, segment) >= 0.35))
+      .filter((range) => !srt?.subtitles.some((subtitle) => overlaps(range, subtitle) >= 0.35))
+      .slice(0, 200)
+  }, [segments, srt, wavePeaks])
+
+  const waveformChunkSeconds = useMemo(() => {
+    return Math.max(1, WAVEFORM_MAX_CHUNK_WIDTH / pxPerSec)
+  }, [pxPerSec])
+  const waveformChunks = useMemo(() => {
+    const totalDuration = Math.max(duration || 0, wavePeaks ? wavePeaks.length / WAVEFORM_POINTS_PER_SEC : 0, 60)
+    const count = Math.max(1, Math.ceil(totalDuration / waveformChunkSeconds))
+    return Array.from({ length: count }, (_, index) => {
+      const start = index * waveformChunkSeconds
+      const end = Math.min(totalDuration, start + waveformChunkSeconds)
+      return { index, start, end }
+    })
+  }, [duration, wavePeaks, waveformChunkSeconds])
+
+  // Draw waveform in chunks. A full-episode canvas can exceed browser limits.
   useEffect(()=>{
-    const canvas = waveCanvasRef.current
-    if(!canvas) return
-    const ctx = canvas.getContext('2d')
-    if(!ctx) return
-    const W = Math.max(1, timelineWidth)
-    const H = 56
     const dpr = (window.devicePixelRatio||1)
-    canvas.width = Math.floor(W * dpr)
-    canvas.height = Math.floor(H * dpr)
-    canvas.style.width = W + 'px'
-    canvas.style.height = H + 'px'
-    ctx.setTransform(1,0,0,1,0,0)
-    ctx.scale(dpr, dpr)
-    ctx.clearRect(0,0,W,H)
-    if(!wavePeaks || wavePeaks.length===0){
-      ctx.strokeStyle = '#2a3040'
+    const H = WAVEFORM_HEIGHT
+    const samples = wavePeaks?.length ?? 0
+    let maxPeak = 0
+    if (wavePeaks) {
+      for (let i = 0; i < samples; i++) {
+        if (wavePeaks[i] > maxPeak) maxPeak = wavePeaks[i]
+      }
+    }
+    const scalePeak = Math.max(0.04, maxPeak)
+
+    const drawBackground = (ctx: CanvasRenderingContext2D, W: number) => {
+      ctx.fillStyle = '#070b12'
+      ctx.fillRect(0,0,W,H)
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)'
+      ctx.lineWidth = 1
+      for (let y = 18; y < H; y += 24) {
+        ctx.beginPath()
+        ctx.moveTo(0, y)
+        ctx.lineTo(W, y)
+        ctx.stroke()
+      }
+      const mid = H/2
+      ctx.strokeStyle = 'rgba(125, 211, 252, 0.24)'
+      ctx.beginPath()
+      ctx.moveTo(0, mid)
+      ctx.lineTo(W, mid)
+      ctx.stroke()
+    }
+
+    waveformChunks.forEach((chunk) => {
+      const canvas = waveChunkRefs.current.get(chunk.index)
+      if(!canvas) return
+      const ctx = canvas.getContext('2d')
+      if(!ctx) return
+      const W = Math.max(1, Math.ceil((chunk.end - chunk.start) * pxPerSec))
+      canvas.width = Math.floor(W * dpr)
+      canvas.height = Math.floor(H * dpr)
+      canvas.style.width = W + 'px'
+      canvas.style.height = H + 'px'
+      ctx.setTransform(1,0,0,1,0,0)
+      ctx.scale(dpr, dpr)
+      ctx.clearRect(0,0,W,H)
+      drawBackground(ctx, W)
+
+      if(!wavePeaks || wavePeaks.length===0){
+      ctx.strokeStyle = '#233044'
       ctx.beginPath()
       ctx.moveTo(0, H/2)
       ctx.lineTo(W, H/2)
       ctx.stroke()
       return
     }
-    ctx.fillStyle = '#0e1016'
-    ctx.fillRect(0,0,W,H)
+
     const mid = H/2
-    ctx.strokeStyle = '#3b82f6'
-    ctx.globalAlpha = 0.7
+    const gradient = ctx.createLinearGradient(0, 0, 0, H)
+    gradient.addColorStop(0, '#fef08a')
+    gradient.addColorStop(0.45, '#38bdf8')
+    gradient.addColorStop(0.55, '#38bdf8')
+    gradient.addColorStop(1, '#22c55e')
+    ctx.strokeStyle = gradient
+    ctx.lineWidth = 1.4
+    ctx.shadowColor = 'rgba(56, 189, 248, 0.45)'
+    ctx.shadowBlur = 7
+    ctx.globalAlpha = 0.92
     ctx.beginPath()
-    const samples = wavePeaks.length
     for(let x=0;x<W;x++){
-      const t = x / pxPerSec
-      const idx = Math.min(samples-1, Math.max(0, Math.floor(t * 50)))
+      const t = chunk.start + x / pxPerSec
+      const idx = Math.min(samples-1, Math.max(0, Math.floor(t * WAVEFORM_POINTS_PER_SEC)))
       const amp = wavePeaks[idx] || 0
-      const h = Math.max(1, amp * (H-8))
+      const normalized = Math.min(1, amp / scalePeak)
+      const h = Math.max(1, normalized * (H-22))
       ctx.moveTo(x, mid - h/2)
       ctx.lineTo(x, mid + h/2)
     }
     ctx.stroke()
+    ctx.shadowBlur = 0
     ctx.globalAlpha = 1
-  }, [wavePeaks, timelineWidth, pxPerSec])
+    })
+  }, [wavePeaks, waveformChunks, pxPerSec])
 
 
 
@@ -733,6 +1234,32 @@ export default function App(){
           onDrop={onDrop}
         >
           {!leftCollapsed && null}
+
+          <div className="section">
+            <div className="card source-status-card">
+              <div className="row" style={{justifyContent:'space-between', marginBottom:10}}>
+                <div>
+                  <div style={{fontWeight:800}}>当前剧集文件</div>
+                  <div className="badge-sm">用于防止 RTTM / SRT / JSON 放错槽位</div>
+                </div>
+                <span className="episode-chip">{currentEpisodeLabel}</span>
+              </div>
+              <div className="source-file-list">
+                {sourceFileRows.map((row) => (
+                  <div key={row.label} className={`source-file-row${row.name ? ' loaded' : ''}`}>
+                    <span className="source-file-dot" />
+                    <span className="source-file-label">{row.label}</span>
+                    <span className="source-file-name" title={row.name || row.detail}>{row.name || row.detail}</span>
+                  </div>
+                ))}
+              </div>
+              <button className="btn source-upload" onClick={()=> candidateInputRef.current?.click()}>
+                <Upload className="file-icon"/>上传 subseg_match_results.json
+              </button>
+              <input ref={candidateInputRef} type="file" style={{display:'none'}} accept=".json"
+                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'candidate')} />
+            </div>
+          </div>
 
           <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'sys') }}>
             <div className="card">
@@ -850,6 +1377,35 @@ export default function App(){
               ) : <div className="badge-sm">Drop an .srt file</div>}
             </div>
           </div>
+
+          <div className="section">
+            <div className="card">
+              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                <div style={{fontWeight:700}}>Waveform Check</div>
+                <span className="badge-sm">{waveMissingRanges.length} gaps</span>
+              </div>
+              <div className="badge-sm" style={{marginBottom:8}}>
+                {waveLoading ? 'Analyzing waveform...' : waveMessage || 'Waveform waits for media'}
+              </div>
+              {waveMissingRanges.length === 0 ? (
+                <div className="badge-sm">No suspected missing speech yet.</div>
+              ) : (
+                <div className="missing-list">
+                  {waveMissingRanges.slice(0, 10).map((range, index) => (
+                    <div className="missing-item" key={`${range.start}-${range.end}`}>
+                      <button className="missing-time" onClick={() => seek(range.start)}>
+                        {index + 1}. {formatHMSms(range.start)} - {formatHMSms(range.end)}
+                      </button>
+                      <button className="btn tiny" onClick={() => insertMissingRange(range)}>插入</button>
+                    </div>
+                  ))}
+                  {waveMissingRanges.length > 10 && (
+                    <div className="badge-sm">Only first 10 shown; zoom the timeline for details.</div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
 
         {/* Center content: video + controls + timeline (resizable video area, scrollable tracks) */}
@@ -940,11 +1496,72 @@ export default function App(){
 
               {/* Waveform */}
               <div className="wave" style={{width: '100%', minWidth: timelineWidth}}>
-                <canvas ref={waveCanvasRef} />
-                {waveFailed && (
-                  <div className="badge-sm" style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center'}}>Waveform unavailable</div>
+                {waveformChunks.map((chunk) => (
+                  <canvas
+                    key={chunk.index}
+                    className="wave-chunk"
+                    ref={(node) => {
+                      if (node) waveChunkRefs.current.set(chunk.index, node)
+                      else waveChunkRefs.current.delete(chunk.index)
+                    }}
+                    style={{
+                      left: chunk.start * pxPerSec,
+                      width: Math.max(1, (chunk.end - chunk.start) * pxPerSec),
+                    }}
+                  />
+                ))}
+                <div className={`wave-status-chip ${waveFailed ? 'failed' : wavePeaks ? 'ready' : ''}`}>
+                  {waveLoading ? '正在生成波形...' : waveFailed ? `波形不可用：${waveMessage}` : wavePeaks ? (waveMessage || '波形已加载') : '等待音频生成波形'}
+                </div>
+                {waveMissingRanges.map((range) => (
+                  <button
+                    key={`${range.start}-${range.end}`}
+                    className="wave-gap"
+                    title={`Suspected missing speech ${formatHMSms(range.start)} - ${formatHMSms(range.end)}`}
+                    style={{
+                      left: range.start * pxPerSec,
+                      width: Math.max(2, (range.end - range.start) * pxPerSec),
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      seek(range.start)
+                    }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                  />
+                ))}
+                {(waveFailed || waveLoading) && (
+                  <div className="badge-sm" style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center'}}>
+                    {waveLoading ? 'Analyzing waveform...' : `Waveform unavailable: ${waveMessage}`}
+                  </div>
                 )}
               </div>
+
+              {hasSRT && (
+                <div className="subtitle-track" style={{width: '100%', minWidth: timelineWidth}}>
+                  <div className="subtitle-track-label">SRT</div>
+                  {allSubtitles.map((sub, index) => {
+                    const left = sub.start * pxPerSec
+                    const width = Math.max(18, (sub.end - sub.start) * pxPerSec)
+                    const isCurrent = currentSubtitle?.id === sub.id
+                    return (
+                      <button
+                        key={sub.id}
+                        className={`subtitle-chip${isCurrent ? ' active' : ''}`}
+                        style={{left, width}}
+                        title={`${formatHMSms(sub.start)} - ${formatHMSms(sub.end)} ${sub.text}`}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          seek(sub.start)
+                        }}
+                        onPointerDown={(event) => event.stopPropagation()}
+                      >
+                        <span className="subtitle-chip-index">{index + 1}</span>
+                        <span className="subtitle-chip-text">{sub.text}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
 
               {/* Tracks container fills remaining height */}
               {/* Tracks container fills remaining height */}
@@ -1204,24 +1821,200 @@ export default function App(){
           </div>
         </div>
 
-        {/* Right panel: legend and subtitles (collapsible) */}
+        {/* Right panel: fixed inspector + scrollable context */}
         <div className={"panel right section" + (rightCollapsed ? ' collapsed' : '')}>
           {!rightCollapsed && (
-            <div style={{display:'grid', gridTemplateRows: (hasRTTM && hasSRT) ? '4fr 6fr' : '1fr', gap:16, height:'100%'}}>
-              {hasRTTM && (
-                                 <div className="card fade-in" style={{minHeight:0, overflowY:'auto'}}>
+            <div className="right-workbench">
+              <div className="card fade-in inspector-card">
+                <div className="row inspector-title-row">
+                  <div>
+                    <div style={{fontWeight:800}}>校对当前片段</div>
+                    <div className="badge-sm">文本正确且说话人正确时，只点“通过”即可</div>
+                  </div>
+                  {selectedSegment && (
+                    <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
+                      通过 checked
+                    </button>
+                  )}
+                </div>
+                {!selectedSegment ? (
+                  <div className="empty-inspector">点击时间轴中的说话片段，或点击波峰疑似漏句区域开始校对。</div>
+                ) : (
+                  <>
+                    <div className="selected-summary">
+                      <span>{formatHMSms(selectedSegment.start)} - {formatHMSms(selectedSegment.end)}</span>
+                      <span>{selectedSpeaker?.name || selectedSegment.speakerId}</span>
+                      <span className={`status-pill status-${selectedSegment.reviewStatus || 'pending'}`}>
+                        {selectedSegment.reviewStatus || 'pending'}
+                      </span>
+                    </div>
+                    <div className="editor-grid">
+                      <label className="field">
+                        <span>说话人</span>
+                        <select
+                          value={selectedSegment.speakerId}
+                          onChange={(event) => updateSelectedSegment({
+                            speakerId: event.target.value,
+                            evidence: { fusion: { role: event.target.value, strategy: 'manual_speaker_review' } },
+                            reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+                          })}
+                        >
+                          {speakers.length === 0 && (
+                            <option value={selectedSegment.speakerId}>{selectedSegment.speakerId}</option>
+                          )}
+                          {speakers.map((speaker) => (
+                            <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="field">
+                        <span>状态</span>
+                        <select
+                          value={selectedSegment.reviewStatus || 'pending'}
+                          onChange={(event) => updateSelectedSegment({ reviewStatus: event.target.value as ReviewStatus })}
+                        >
+                          <option value="pending">pending</option>
+                          <option value="checked">checked</option>
+                          <option value="corrected">corrected</option>
+                          <option value="inserted">inserted</option>
+                          <option value="uncertain">uncertain</option>
+                          <option value="deleted">deleted</option>
+                        </select>
+                      </label>
+                      <label className="field">
+                        <span>开始秒</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.01}
+                          value={selectedSegment.start.toFixed(3)}
+                          onChange={(event) => updateSelectedSegment({ start: Math.max(0, Number(event.target.value) || 0) })}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>结束秒</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.01}
+                          value={selectedSegment.end.toFixed(3)}
+                          onChange={(event) => updateSelectedSegment({ end: Math.max(selectedSegment.start + MIN_DUR, Number(event.target.value) || selectedSegment.end) })}
+                        />
+                      </label>
+                      <label className="field wide">
+                        <span>台词文本（只有文本错/漏时才需要手动输入）</span>
+                        <textarea
+                          rows={3}
+                          value={selectedSegment.text || ''}
+                          onChange={(event) => updateSelectedSegment({
+                            text: event.target.value,
+                            evidence: { text: { source: 'manual', value: event.target.value } },
+                            reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+                          })}
+                          placeholder="输入或修正这一句台词"
+                        />
+                      </label>
+                      <label className="field wide">
+                        <span>备注</span>
+                        <textarea
+                          rows={2}
+                          value={selectedSegment.notes || ''}
+                          onChange={(event) => updateSelectedSegment({ notes: event.target.value })}
+                          placeholder="记录证据、疑问或修改原因"
+                        />
+                      </label>
+                      <div className="row wide inspector-actions">
+                        <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>通过</button>
+                        <button className="btn tiny" onClick={() => updateSelectedSegment({ reviewStatus: 'corrected' })}>标记 corrected</button>
+                        <button className="btn tiny" onClick={() => seek(selectedSegment.start)}>跳转播放</button>
+                      </div>
+                    </div>
+                    <div className="candidate-panel">
+                      <div className="candidate-header">
+                        <span>候选匹配 JSON</span>
+                        <span className="badge-sm">{candidateFile?.name || '未加载 subseg_match_results.json'}</span>
+                      </div>
+                      {!candidateFile ? (
+                        <div className="badge-sm">加载候选 JSON 后，这里会显示 top_5_speakers / top_5_faces。</div>
+                      ) : !selectedCandidate ? (
+                        <div className="badge-sm">当前片段附近没有匹配到候选结果。</div>
+                      ) : (
+                        <>
+                          <div className="candidate-line">
+                            <span>{selectedCandidate.segmentKey}</span>
+                            <span>{selectedCandidate.start !== undefined ? formatHMSms(selectedCandidate.start) : '--'} - {selectedCandidate.end !== undefined ? formatHMSms(selectedCandidate.end) : '--'}</span>
+                          </div>
+                          {selectedCandidate.subtitleText && (
+                            <div className="candidate-text">{selectedCandidate.subtitleText}</div>
+                          )}
+                          <div className="candidate-pills">
+                            {selectedCandidate.top5Speakers.slice(0, 5).map((candidate, index) => {
+                              const role = candidate.role || candidate.speaker || `候选${index + 1}`
+                              return (
+                                <button
+                                  key={`${role}-${index}`}
+                                  className="candidate-pill"
+                                  onClick={() => {
+                                    const existing = speakers.find((speaker) => speaker.id === role || speaker.name === role)
+                                    const speaker = existing || addSpeaker(role, 'candidate')
+                                    updateSelectedSegment({
+                                      speakerId: speaker.id,
+                                      reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+                                      evidence: {
+                                        fusion: {
+                                          role: speaker.name,
+                                          strategy: 'candidate_top5_speaker',
+                                          confidence: candidate.score,
+                                        },
+                                      },
+                                    })
+                                  }}
+                                  title="点击后应用为当前片段说话人"
+                                >
+                                  {role}{candidate.score !== undefined ? ` ${candidate.score.toFixed(3)}` : ''}
+                                </button>
+                              )
+                            })}
+                            {selectedCandidate.top5Speakers.length === 0 && <span className="badge-sm">top_5_speakers 为空</span>}
+                          </div>
+                          <div className="badge-sm">top_5_faces: {selectedCandidate.top5Faces.length || '空'}</div>
+                        </>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="right-scroll">
+                <div className="card fade-in">
                   <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                    <div style={{fontWeight:700}}>Speakers</div>
-                    <button className="btn" onClick={()=>{
-                      const idx = speakers.length+1
-                      const palette = ['#3B82F6','#EF4444','#10B981','#F59E0B','#8B5CF6','#06B6D4','#84CC16','#EC4899','#14B8A6','#F472B6']
-                      const color = palette[(idx-1)%palette.length]
-                      const id = `speaker${idx}`
-                      setSpeakers(prev => [...prev, {id, name: id, color, visible: true}])
-                    }}><Plus size={14}/>添加</button>
+                    <div style={{fontWeight:700}}>说话人</div>
+                    <span className="badge-sm">{speakers.length || 0} speakers</span>
+                  </div>
+                  <div className="speaker-add-form">
+                    <input
+                      value={newSpeakerName}
+                      onChange={(event) => setNewSpeakerName(event.target.value)}
+                      placeholder="新说话人名，例如 杨冬"
+                    />
+                    <button className="btn tiny" onClick={() => addSpeaker()}><Plus size={14}/>添加</button>
+                    <button
+                      className="btn tiny"
+                      disabled={!selectedSegment}
+                      onClick={() => {
+                        const speaker = addSpeaker(undefined, 'manual')
+                        updateSelectedSegment({
+                          speakerId: speaker.id,
+                          reviewStatus: selectedSegment?.reviewStatus === 'pending' ? 'corrected' : selectedSegment?.reviewStatus,
+                          evidence: { fusion: { role: speaker.name, strategy: 'manual_new_speaker' } },
+                        })
+                      }}
+                    >
+                      添加并用于当前
+                    </button>
                   </div>
                   <div className="grid" >
-                    {speakers.length===0 && <div className="badge-sm">No RTTM loaded</div>}
+                    {speakers.length===0 && <div className="badge-sm">尚无说话人。可手动添加，或先加载 RTTM。</div>}
                     {speakers.map(spk=> (
                       <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
                         <input type="color" value={spk.color} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, color: e.target.value}: s))} style={{width:24, height:24, border:'none', background:'transparent', padding:0}}/>
@@ -1238,62 +2031,84 @@ export default function App(){
                     ))}
                   </div>
                 </div>
-              )}
 
-              {/* Subtitles Preview */}
-              {hasSRT && (
-              <div className="card fade-in" style={{minHeight:0, display:'flex', flexDirection:'column'}}>
-                <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                  <div style={{fontWeight:700}}>Subtitles</div>
-                  {srt && (
-                    <input
-                      value={subtitleQuery}
-                      onChange={e=>setSubtitleQuery(e.target.value)}
-                      placeholder="Search subtitles..."
-                      style={{
-                        flex:1,
-                        marginLeft:8,
-                        background:'#0f141b',
-                        border:'1px solid var(--border)',
-                        color:'var(--text)',
-                        borderRadius:8,
-                        padding:'6px 8px',
-                        minWidth:0
-                      }}
-                    />
-                  )}
-                </div>
-                {!srt ? (
-                  <div className="badge-sm">No .srt loaded</div>
-                ) : (
-                  <div ref={aroundListRef} style={{flex:1, minHeight:0, overflow:'auto', display:'grid', gap:10}}>
-                    {visibleSubtitles.map((sub) => {
-                      const isCurrent = currentSubtitle?.id === sub.id
-                      return (
-                        <div key={sub.id} className={`sub-item${isCurrent ? ' current' : ''}`} style={{
-                          background: isCurrent ? '#1F2937' : '#111827',
-                          padding: '10px 12px',
-                          borderRadius: 8,
-                          border: '1px solid var(--border)',
-                          opacity: isCurrent ? 1 : 0.85,
-                          cursor: 'pointer'
-                        }} onClick={()=>seek(sub.start)} title={`${formatTime(sub.start)} - ${formatTime(sub.end)}`}>
-                          <div style={{fontSize: 12, color: '#9aa4b2', marginBottom: 6}}>
-                            {formatTime(sub.start)} - {formatTime(sub.end)}
-                          </div>
-                          <div style={{whiteSpace:'pre-wrap', fontSize: 14, lineHeight: 1.4}}>{sub.text}</div>
+                {segments.length > 0 && (
+                  <div className="card fade-in segment-card">
+                    <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
+                      <div style={{fontWeight:700}}>片段表</div>
+                      <span className="badge-sm">显示 {visibleSegmentRows.length} / {segments.length}</span>
+                    </div>
+                    <div className="segment-table">
+                      {visibleSegmentRows.map(({ segment, index }) => {
+                        const speaker = speakers.find((item) => item.id === segment.speakerId)
+                        return (
+                          <button
+                            key={segment.id}
+                            className={`segment-row${segment.id === selectedSegId ? ' current' : ''}`}
+                            onClick={() => {
+                              setSelectedSegId(segment.id)
+                              seek(segment.start)
+                            }}
+                          >
+                            <span>{index + 1}</span>
+                            <span>{formatHMSms(segment.start)}</span>
+                            <span>{speaker?.name || segment.speakerId}</span>
+                            <span>{segment.reviewStatus || 'pending'}</span>
+                            <span>{segment.text || '-'}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {hasSRT && (
+                  <div className="card fade-in subtitles-card">
+                    <div className="row subtitles-title-row">
+                      <div style={{fontWeight:700}}>字幕上下文</div>
+                      {srt && (
+                        <label className="follow-toggle">
+                          <input type="checkbox" checked={followSubtitle} onChange={(event) => setFollowSubtitle(event.target.checked)} />
+                          跟随播放
+                        </label>
+                      )}
+                    </div>
+                    {srt && (
+                      <input
+                        className="subtitle-search"
+                        value={subtitleQuery}
+                        onChange={e=>setSubtitleQuery(e.target.value)}
+                        placeholder="搜索字幕..."
+                      />
+                    )}
+                    {!srt ? (
+                      <div className="badge-sm">未加载 .srt 文件</div>
+                    ) : (
+                      <>
+                        <div className="badge-sm" style={{marginBottom:8}}>
+                          显示 {visibleSubtitles.length} / {srt.subtitles.length}，搜索时最多显示前 250 条
                         </div>
-                      )
-                    })}
-                    {visibleSubtitles.length === 0 && (
-                      <div style={{color: '#6B7280', fontSize: 14, textAlign: 'center', padding: '20px 0'}}>
-                        No subtitles
-                      </div>
+                        <div ref={aroundListRef} className="subtitle-list">
+                          {visibleSubtitles.map((sub) => {
+                            const isCurrent = currentSubtitle?.id === sub.id
+                            return (
+                              <div key={sub.id} className={`sub-item${isCurrent ? ' current' : ''}`} onClick={()=>seek(sub.start)} title={`${formatTime(sub.start)} - ${formatTime(sub.end)}`}>
+                                <div className="sub-time">
+                                  {formatTime(sub.start)} - {formatTime(sub.end)}
+                                </div>
+                                <div className="sub-text">{sub.text}</div>
+                              </div>
+                            )
+                          })}
+                          {visibleSubtitles.length === 0 && (
+                            <div className="empty-list">没有匹配字幕</div>
+                          )}
+                        </div>
+                      </>
                     )}
                   </div>
                 )}
               </div>
-              )}
             </div>
           )}
         </div>
