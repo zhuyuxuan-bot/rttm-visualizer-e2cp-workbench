@@ -764,13 +764,64 @@ input[type="range"] { width: 200px; }
   resize: vertical;
   line-height: 1.45;
 }
+.quick-speaker-panel,
+.missing-insert-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 10px;
+  background: rgba(15, 20, 27, 0.72);
+}
+.quick-panel-title {
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+.quick-speaker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 6px;
+}
+.speaker-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #101723;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.speaker-chip span {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+}
+.speaker-chip:hover,
+.speaker-chip.active {
+  border-color: var(--accent);
+  background: #172033;
+}
+.missing-insert-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
 
 .segment-card {
   min-height: 180px;
 }
 .segment-toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) repeat(3, auto);
   gap: 8px;
   margin-bottom: 8px;
 }
@@ -818,3 +869,13 @@ input[type="range"] { width: 200px; }
 
 /* Overlay variant of appbar when we added extra controls; reuse same look */
 .appbar.overlay-controls { position: sticky; top: 0; }
+
+@media (max-width: 1100px) {
+  .segment-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+  .missing-insert-grid,
+  .editor-grid {
+    grid-template-columns: 1fr;
+  }
+}

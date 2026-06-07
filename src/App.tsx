@@ -446,6 +446,7 @@ export default function App(){
   const [newSpeakerName, setNewSpeakerName] = useState('')
   const [followSubtitle, setFollowSubtitle] = useState(false)
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
+  const [missingInsertDraft, setMissingInsertDraft] = useState({ start: '', end: '', text: '', speakerId: '' })
   const dragRef = useRef<{ type: 'start'|'end'|'move'|'create'; speakerId: string; segId?: string; anchorTime?: number } | null>(null)
   const [dragTip, setDragTip] = useState<{x:number;y:number;text:string}|null>(null)
   const segmentsRef = useRef<Segment[]>([])
@@ -853,6 +854,14 @@ export default function App(){
       percent: Math.round((reviewed / denominator) * 100),
     }
   }, [segments])
+  const filteredPendingCount = useMemo(
+    () => filteredSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending').length,
+    [filteredSegmentRows],
+  )
+  const visiblePendingCount = useMemo(
+    () => visibleSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending').length,
+    [visibleSegmentRows],
+  )
 
   // right panel auto collapse/expand logic based on data presence
   const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
@@ -950,6 +959,34 @@ export default function App(){
     const target = afterCurrent || rows[0]
     setSelectedSegId(target.segment.id)
     seek(target.segment.start)
+  }
+  const assignSelectedSpeaker = (speaker: Speaker) => {
+    if (!selectedSegment) return
+    updateSelectedSegment({
+      speakerId: speaker.id,
+      evidence: { fusion: { role: speaker.name, strategy: 'manual_speaker_quick_assign' } },
+      reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+    })
+  }
+  const markPendingRowsAsChecked = (scope: 'visible' | 'filtered') => {
+    const rows = scope === 'visible' ? visibleSegmentRows : filteredSegmentRows
+    const targetIds = new Set(
+      rows
+        .filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending')
+        .map(({ segment }) => segment.id),
+    )
+    if (targetIds.size === 0) return
+    setSegments((prev) => prev.map((segment) => (
+      targetIds.has(segment.id)
+        ? {
+            ...segment,
+            reviewStatus: 'checked',
+            notes: segment.notes || 'Batch checked from annotation queue',
+          }
+        : segment
+    )))
+    setToast({ message: `已将 ${targetIds.size} 条 pending 标记为 checked` })
+    window.setTimeout(() => setToast(null), 3200)
   }
   const onTimeUpdate = () => {
     const el = videoRef.current; if(!el) return
@@ -1251,6 +1288,41 @@ export default function App(){
     })
     setSelectedSegId(id)
     seek(range.start)
+  }
+
+  const insertMissingDraft = () => {
+    const start = Number(missingInsertDraft.start)
+    const end = Number(missingInsertDraft.end)
+    const text = missingInsertDraft.text.trim()
+    const speakerId = missingInsertDraft.speakerId || selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      setToast({ message: '漏句插入失败：请填写合法的开始和结束时间' })
+      window.setTimeout(() => setToast(null), 4200)
+      return
+    }
+    if (!speakers.some((speaker) => speaker.id === speakerId)) {
+      setSpeakers((prev) => [
+        ...prev,
+        { id: speakerId, name: speakerId, color: '#8B5CF6', visible: true, source: 'manual' },
+      ])
+    }
+    const id = createSegmentAt(speakerId, start, {
+      start,
+      end,
+      text,
+      reviewStatus: 'inserted',
+      notes: text ? 'Manual inserted missing dialogue' : 'Manual inserted missing dialogue; text pending',
+      evidence: {
+        text: { source: 'manual', value: text },
+        waveform: { suspectedMissing: true },
+        fusion: { role: speakerId, strategy: 'manual_missing_dialogue_insert' },
+      },
+    })
+    setMissingInsertDraft({ start: '', end: '', text: '', speakerId })
+    setSelectedSegId(id)
+    seek(start)
+    setToast({ message: '已插入一条疑似遗漏台词' })
+    window.setTimeout(() => setToast(null), 3200)
   }
 
   // Remove segment with optional undo
@@ -2329,6 +2401,24 @@ export default function App(){
                         {selectedSegment.reviewStatus || 'pending'}
                       </span>
                     </div>
+                    {speakers.length > 0 && (
+                      <div className="quick-speaker-panel">
+                        <div className="quick-panel-title">一键改说话人</div>
+                        <div className="quick-speaker-grid">
+                          {speakers.map((speaker) => (
+                            <button
+                              key={speaker.id}
+                              className={`speaker-chip${speaker.id === selectedSegment.speakerId ? ' active' : ''}`}
+                              onClick={() => assignSelectedSpeaker(speaker)}
+                              title={`将当前片段标为 ${speaker.name}`}
+                            >
+                              <span style={{background: speaker.color}} />
+                              {speaker.name}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <div className="editor-grid">
                       <label className="field">
                         <span>说话人</span>
@@ -2539,6 +2629,71 @@ export default function App(){
                       >
                         下一条 pending
                       </button>
+                      <button
+                        className="btn tiny"
+                        disabled={visiblePendingCount === 0}
+                        onClick={() => markPendingRowsAsChecked('visible')}
+                      >
+                        本页通过 {visiblePendingCount}
+                      </button>
+                      <button
+                        className="btn tiny"
+                        disabled={filteredPendingCount === 0}
+                        onClick={() => markPendingRowsAsChecked('filtered')}
+                      >
+                        当前筛选通过 {filteredPendingCount}
+                      </button>
+                    </div>
+                    <div className="missing-insert-card">
+                      <div className="quick-panel-title">漏句插入向导</div>
+                      <div className="missing-insert-grid">
+                        <label className="field">
+                          <span>开始秒</span>
+                          <input
+                            type="number"
+                            min={0}
+                            step={0.01}
+                            value={missingInsertDraft.start}
+                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, start: event.target.value }))}
+                            placeholder="8.47"
+                          />
+                        </label>
+                        <label className="field">
+                          <span>结束秒</span>
+                          <input
+                            type="number"
+                            min={0}
+                            step={0.01}
+                            value={missingInsertDraft.end}
+                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, end: event.target.value }))}
+                            placeholder="8.57"
+                          />
+                        </label>
+                        <label className="field">
+                          <span>说话人</span>
+                          <select
+                            value={missingInsertDraft.speakerId || selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'}
+                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, speakerId: event.target.value }))}
+                          >
+                            {speakers.length === 0 && <option value="UNKNOWN">UNKNOWN</option>}
+                            {speakers.map((speaker) => (
+                              <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="field">
+                          <span>台词</span>
+                          <input
+                            value={missingInsertDraft.text}
+                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, text: event.target.value }))}
+                            placeholder="可先留空，稍后补"
+                          />
+                        </label>
+                      </div>
+                      <div className="row" style={{justifyContent:'space-between', gap:8}}>
+                        <span className="badge-sm">用于字幕/RTTM 遗漏：插入后状态为 inserted</span>
+                        <button className="btn tiny pass-btn" onClick={insertMissingDraft}>插入漏句</button>
+                      </div>
                     </div>
                     <div className="segment-table">
                       {visibleSegmentRows.map(({ segment, index }) => {
