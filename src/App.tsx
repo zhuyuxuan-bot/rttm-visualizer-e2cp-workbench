@@ -341,6 +341,7 @@ export default function App(){
   const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
   const [newSpeakerName, setNewSpeakerName] = useState('')
   const [followSubtitle, setFollowSubtitle] = useState(false)
+  const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const dragRef = useRef<{ type: 'start'|'end'|'move'|'create'; speakerId: string; segId?: string; anchorTime?: number } | null>(null)
   const [dragTip, setDragTip] = useState<{x:number;y:number;text:string}|null>(null)
   const segmentsRef = useRef<Segment[]>([])
@@ -571,17 +572,42 @@ export default function App(){
     () => segments.slice().sort((a, b) => a.start - b.start).map((segment, index) => ({ segment, index })),
     [segments],
   )
+  const filteredSegmentRows = useMemo(() => {
+    if (segmentStatusFilter === 'all') return sortedSegmentRows
+    return sortedSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === segmentStatusFilter)
+  }, [segmentStatusFilter, sortedSegmentRows])
   const selectedSegmentRowIndex = useMemo(
-    () => sortedSegmentRows.findIndex((row) => row.segment.id === selectedSegId),
-    [selectedSegId, sortedSegmentRows],
+    () => filteredSegmentRows.findIndex((row) => row.segment.id === selectedSegId),
+    [filteredSegmentRows, selectedSegId],
   )
   const visibleSegmentRows = useMemo(() => {
-    if (sortedSegmentRows.length <= 140) return sortedSegmentRows
+    if (filteredSegmentRows.length <= 140) return filteredSegmentRows
     const centerIndex = selectedSegmentRowIndex >= 0 ? selectedSegmentRowIndex : 0
     const startIdx = Math.max(0, centerIndex - 45)
-    const endIdx = Math.min(sortedSegmentRows.length, centerIndex + 75)
-    return sortedSegmentRows.slice(startIdx, endIdx)
-  }, [selectedSegmentRowIndex, sortedSegmentRows])
+    const endIdx = Math.min(filteredSegmentRows.length, centerIndex + 75)
+    return filteredSegmentRows.slice(startIdx, endIdx)
+  }, [filteredSegmentRows, selectedSegmentRowIndex])
+  const reviewProgress = useMemo(() => {
+    const counts: Record<ReviewStatus, number> = {
+      pending: 0,
+      checked: 0,
+      corrected: 0,
+      inserted: 0,
+      deleted: 0,
+      uncertain: 0,
+    }
+    for (const segment of segments) {
+      counts[segment.reviewStatus || 'pending'] += 1
+    }
+    const reviewed = counts.checked + counts.corrected + counts.inserted + counts.deleted
+    const denominator = Math.max(1, segments.length)
+    return {
+      counts,
+      total: segments.length,
+      reviewed,
+      percent: Math.round((reviewed / denominator) * 100),
+    }
+  }, [segments])
 
   // right panel auto collapse/expand logic based on data presence
   const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
@@ -671,6 +697,14 @@ export default function App(){
   const seek = (t:number) => {
     const el = videoRef.current; if(!el) return
     el.currentTime = Math.max(0, Math.min(t, duration||el.duration||0))
+  }
+  const jumpToNextStatus = (status: ReviewStatus = 'pending') => {
+    const rows = sortedSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === status)
+    if (rows.length === 0) return
+    const afterCurrent = rows.find(({ segment }) => segment.start > currentTime + 0.03)
+    const target = afterCurrent || rows[0]
+    setSelectedSegId(target.segment.id)
+    seek(target.segment.start)
   }
   const onTimeUpdate = () => {
     const el = videoRef.current; if(!el) return
@@ -1348,6 +1382,23 @@ export default function App(){
                     : `还缺 ${missingRequiredCount} 个必需文件`}
                 </span>
               </div>
+              <div className="review-progress-card">
+                <div className="row" style={{justifyContent:'space-between'}}>
+                  <span>标注进度</span>
+                  <strong>{reviewProgress.percent}%</strong>
+                </div>
+                <div className="progress-bar">
+                  <span style={{width: `${reviewProgress.percent}%`}} />
+                </div>
+                <div className="progress-grid">
+                  <span>总数 {reviewProgress.total}</span>
+                  <span>pending {reviewProgress.counts.pending}</span>
+                  <span>checked {reviewProgress.counts.checked}</span>
+                  <span>corrected {reviewProgress.counts.corrected}</span>
+                  <span>inserted {reviewProgress.counts.inserted}</span>
+                  <span>uncertain {reviewProgress.counts.uncertain}</span>
+                </div>
+              </div>
               {currentEpisodeLabel !== '未识别' && currentEpisodeLabel !== episodeLabelFromId(selectedEpisodeId) && (
                 <div className="wizard-warning">
                   当前已加载文件更像 {currentEpisodeLabel}，但你选择的是 {episodeLabelFromId(selectedEpisodeId)}。如果要标注新剧集，请重新上传对应文件。
@@ -1947,11 +1998,20 @@ export default function App(){
                     <div style={{fontWeight:800}}>校对当前片段</div>
                     <div className="badge-sm">文本正确且说话人正确时，只点“通过”即可</div>
                   </div>
-                  {selectedSegment && (
-                    <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
-                      通过 checked
+                  <div className="row" style={{gap:6, flexWrap:'wrap', justifyContent:'flex-end'}}>
+                    <button
+                      className="btn tiny"
+                      disabled={reviewProgress.counts.pending === 0}
+                      onClick={() => jumpToNextStatus('pending')}
+                    >
+                      下一条 pending
                     </button>
-                  )}
+                    {selectedSegment && (
+                      <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
+                        通过 checked
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {!selectedSegment ? (
                   <div className="empty-inspector">点击时间轴中的说话片段，或点击波峰疑似漏句区域开始校对。</div>
@@ -2152,7 +2212,28 @@ export default function App(){
                   <div className="card fade-in segment-card">
                     <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
                       <div style={{fontWeight:700}}>片段表</div>
-                      <span className="badge-sm">显示 {visibleSegmentRows.length} / {segments.length}</span>
+                      <span className="badge-sm">显示 {visibleSegmentRows.length} / {filteredSegmentRows.length}</span>
+                    </div>
+                    <div className="segment-toolbar">
+                      <select
+                        value={segmentStatusFilter}
+                        onChange={(event) => setSegmentStatusFilter(event.target.value as ReviewStatus | 'all')}
+                      >
+                        <option value="all">全部状态</option>
+                        <option value="pending">pending</option>
+                        <option value="checked">checked</option>
+                        <option value="corrected">corrected</option>
+                        <option value="inserted">inserted</option>
+                        <option value="uncertain">uncertain</option>
+                        <option value="deleted">deleted</option>
+                      </select>
+                      <button
+                        className="btn tiny"
+                        disabled={reviewProgress.counts.pending === 0}
+                        onClick={() => jumpToNextStatus('pending')}
+                      >
+                        下一条 pending
+                      </button>
                     </div>
                     <div className="segment-table">
                       {visibleSegmentRows.map(({ segment, index }) => {
