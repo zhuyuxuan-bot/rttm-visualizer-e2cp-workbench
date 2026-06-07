@@ -227,6 +227,28 @@ function inferEpisodeLabel(names: Array<string | undefined>): string {
   return numericMatch ? `EP${numericMatch[1].padStart(2, '0')}` : '未识别'
 }
 
+function normalizeEpisodeId(value: string | number): string {
+  const raw = String(value).trim()
+  const match = raw.match(/\d{1,2}/)
+  const n = match ? Math.max(1, Math.min(30, Number(match[0]))) : 1
+  return n.toString().padStart(2, '0')
+}
+
+function episodeLabelFromId(value: string): string {
+  return `EP${normalizeEpisodeId(value)}`
+}
+
+function fileMatchesEpisode(name: string | undefined, episodeId: string): boolean {
+  if (!name) return false
+  const normalized = normalizeEpisodeId(episodeId)
+  const patterns = [
+    new RegExp(`\\bep[\\s_-]*0?${Number(normalized)}\\b`, 'i'),
+    new RegExp(`(?:^|[^\\d])0?${Number(normalized)}(?:[._\\-\\s]|$)`, 'i'),
+    new RegExp(`第\\s*0?${Number(normalized)}\\s*[集话話]`, 'i'),
+  ]
+  return patterns.some((pattern) => pattern.test(name))
+}
+
 function normalizeCandidateFace(raw: unknown): CandidateFace {
   const record = asRecord(raw)
   if (!record) return { raw }
@@ -309,6 +331,8 @@ export default function App(){
   const [showRefTrack, setShowRefTrack] = useState<boolean>(true)
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(false)
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState('02')
+  const episodeManuallySelectedRef = useRef(false)
   const centerRef = useRef<HTMLDivElement>(null)
   const [videoAreaHeight, setVideoAreaHeight] = useState<number>(400)
   const resizeStateRef = useRef<{startY:number; startH:number} | null>(null)
@@ -567,13 +591,72 @@ export default function App(){
     () => inferEpisodeLabel([media?.name, rttm?.name, refRTTM?.name, srt?.name, candidateFile?.name]),
     [media?.name, rttm?.name, refRTTM?.name, srt?.name, candidateFile?.name],
   )
-  const sourceFileRows = useMemo(() => [
-    { label: 'Media', name: media?.name, detail: media ? formatTime(duration || media.duration || 0) : '必需' },
-    { label: 'RTTM', name: rttm?.name, detail: rttm ? `${segments.length} segments` : '必需' },
-    { label: 'Ref RTTM', name: refRTTM?.name, detail: refRTTM ? `${refSegments.length} ref segments` : '可选' },
-    { label: 'SRT', name: srt?.name, detail: srt ? `${srt.subtitles.length} subtitles` : '建议加载' },
-    { label: 'subseg JSON', name: candidateFile?.name, detail: candidateFile ? `${candidateFile.entries.length} matches` : '建议加载' },
-  ], [candidateFile, duration, media, refRTTM, refSegments.length, rttm, segments.length, srt])
+  useEffect(() => {
+    if (!episodeManuallySelectedRef.current && currentEpisodeLabel !== '未识别') {
+      setSelectedEpisodeId(currentEpisodeLabel.replace(/^EP/i, ''))
+    }
+  }, [currentEpisodeLabel])
+  const episodeRequirementRows = useMemo(() => {
+    const makeState = (name: string | undefined, optional = false) => {
+      if (!name) return optional ? 'optional-missing' : 'missing'
+      return fileMatchesEpisode(name, selectedEpisodeId) ? 'loaded' : 'mismatch'
+    }
+    return [
+      {
+        key: 'media',
+        label: '视频/音频',
+        required: true,
+        name: media?.name,
+        detail: media ? formatTime(duration || media.duration || 0) : '用于播放、听音和波峰分析',
+        state: makeState(media?.name),
+        action: () => mediaInputRef.current?.click(),
+      },
+      {
+        key: 'rttm',
+        label: 'RTTM',
+        required: true,
+        name: rttm?.name,
+        detail: rttm ? `${segments.length} segments` : '说话人时间段主文件',
+        state: makeState(rttm?.name),
+        action: () => rttmInputRef.current?.click(),
+      },
+      {
+        key: 'srt',
+        label: 'SRT',
+        required: true,
+        name: srt?.name,
+        detail: srt ? `${srt.subtitles.length} subtitles` : '台词文本和字幕上下文',
+        state: makeState(srt?.name),
+        action: () => srtInputRef.current?.click(),
+      },
+      {
+        key: 'subseg',
+        label: 'subseg JSON',
+        required: false,
+        name: candidateFile?.name,
+        detail: candidateFile ? `${candidateFile.entries.length} matches` : '声纹/人脸候选证据，强烈建议加载',
+        state: makeState(candidateFile?.name, true),
+        action: () => candidateInputRef.current?.click(),
+      },
+      {
+        key: 'ref',
+        label: 'Ref RTTM',
+        required: false,
+        name: refRTTM?.name,
+        detail: refRTTM ? `${refSegments.length} ref segments` : '可选，用于 DER/参考对比',
+        state: makeState(refRTTM?.name, true),
+        action: () => refRttmInputRef.current?.click(),
+      },
+    ] as const
+  }, [candidateFile, duration, media, refRTTM, refSegments.length, rttm, segments.length, selectedEpisodeId, srt])
+  const missingRequiredCount = useMemo(
+    () => episodeRequirementRows.filter((row) => row.required && row.state !== 'loaded').length,
+    [episodeRequirementRows],
+  )
+  const episodeOptions = useMemo(
+    () => Array.from({ length: 30 }, (_, index) => normalizeEpisodeId(index + 1)),
+    [],
+  )
   useEffect(()=>{
     if(!hasRTTM && !hasSRT) setRightCollapsed(true)
     else setRightCollapsed(false)
@@ -1236,26 +1319,59 @@ export default function App(){
           {!leftCollapsed && null}
 
           <div className="section">
-            <div className="card source-status-card">
-              <div className="row" style={{justifyContent:'space-between', marginBottom:10}}>
+            <div className="card source-status-card episode-wizard">
+              <div className="wizard-header">
                 <div>
-                  <div style={{fontWeight:800}}>当前剧集文件</div>
-                  <div className="badge-sm">用于防止 RTTM / SRT / JSON 放错槽位</div>
+                  <div style={{fontWeight:800}}>剧集加载向导</div>
+                  <div className="badge-sm">先选集数，再逐项检查文件是否齐全</div>
                 </div>
-                <span className="episode-chip">{currentEpisodeLabel}</span>
+                <div className="episode-selector">
+                  <span>标注</span>
+                  <select
+                    value={selectedEpisodeId}
+                    onChange={(event) => {
+                      episodeManuallySelectedRef.current = true
+                      setSelectedEpisodeId(normalizeEpisodeId(event.target.value))
+                    }}
+                  >
+                    {episodeOptions.map((episodeId) => (
+                      <option key={episodeId} value={episodeId}>{episodeLabelFromId(episodeId)}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
+              <div className={`wizard-summary ${missingRequiredCount === 0 ? 'ready' : 'blocked'}`}>
+                <span>{episodeLabelFromId(selectedEpisodeId)}</span>
+                <span>
+                  {missingRequiredCount === 0
+                    ? '必需文件已齐，可以开始标注'
+                    : `还缺 ${missingRequiredCount} 个必需文件`}
+                </span>
+              </div>
+              {currentEpisodeLabel !== '未识别' && currentEpisodeLabel !== episodeLabelFromId(selectedEpisodeId) && (
+                <div className="wizard-warning">
+                  当前已加载文件更像 {currentEpisodeLabel}，但你选择的是 {episodeLabelFromId(selectedEpisodeId)}。如果要标注新剧集，请重新上传对应文件。
+                </div>
+              )}
               <div className="source-file-list">
-                {sourceFileRows.map((row) => (
-                  <div key={row.label} className={`source-file-row${row.name ? ' loaded' : ''}`}>
+                {episodeRequirementRows.map((row) => (
+                  <div key={row.key} className={`source-file-row wizard-file ${row.state}`}>
                     <span className="source-file-dot" />
-                    <span className="source-file-label">{row.label}</span>
-                    <span className="source-file-name" title={row.name || row.detail}>{row.name || row.detail}</span>
+                    <div className="source-file-main">
+                      <div className="source-file-title">
+                        <span>{row.label}</span>
+                        <span className={`wizard-tag ${row.required ? 'required' : 'optional'}`}>
+                          {row.required ? '必需' : '可选'}
+                        </span>
+                      </div>
+                      <div className="source-file-name" title={row.name || row.detail}>{row.name || row.detail}</div>
+                    </div>
+                    <button className="btn tiny" onClick={row.action}>
+                      {row.name ? '替换' : '上传'}
+                    </button>
                   </div>
                 ))}
               </div>
-              <button className="btn source-upload" onClick={()=> candidateInputRef.current?.click()}>
-                <Upload className="file-icon"/>上传 subseg_match_results.json
-              </button>
               <input ref={candidateInputRef} type="file" style={{display:'none'}} accept=".json"
                 onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'candidate')} />
             </div>
