@@ -87,6 +87,110 @@ interface Speaker {
   source?: 'rttm' | 'manual' | 'candidate'
 }
 
+interface AnnotationSnapshot {
+  segments: Segment[]
+  speakers: Speaker[]
+}
+
+interface DraftPayload extends AnnotationSnapshot {
+  schemaVersion: 'e2cp.rttm_workbench.draft.v1'
+  savedAt: string
+  selectedEpisodeId: string
+  selectedSegId: string | null
+  sourceFiles: {
+    media?: string
+    rttm?: string
+    refRTTM?: string
+    srt?: string
+    candidate?: string
+  }
+}
+
+interface ExportIssues {
+  blocking: string[]
+  warnings: string[]
+}
+
+const DRAFT_SCHEMA_VERSION = 'e2cp.rttm_workbench.draft.v1' as const
+const MAX_HISTORY_STEPS = 80
+
+function cloneSegments(segments: Segment[]): Segment[] {
+  return segments.map((segment) => ({
+    ...segment,
+    evidence: segment.evidence
+      ? JSON.parse(JSON.stringify(segment.evidence)) as SegmentEvidence
+      : undefined,
+  }))
+}
+
+function cloneSpeakers(speakers: Speaker[]): Speaker[] {
+  return speakers.map((speaker) => ({ ...speaker }))
+}
+
+function buildAnnotationSnapshot(segments: Segment[], speakers: Speaker[]): AnnotationSnapshot {
+  return {
+    segments: cloneSegments(segments),
+    speakers: cloneSpeakers(speakers),
+  }
+}
+
+function annotationSnapshotSignature(snapshot: AnnotationSnapshot): string {
+  return JSON.stringify(snapshot)
+}
+
+function formatSavedAt(value: string | null): string {
+  if (!value) return '等待标注变更'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function buildExportIssues(input: {
+  segments: Segment[]
+  speakers: Speaker[]
+  media: MediaFile | null
+  rttm: RTTMFile | null
+  srt: SRTFile | null
+  candidateFile: CandidateFile | null
+  selectedEpisodeId: string
+  waveMissingRanges: Array<{ start: number; end: number }>
+}): ExportIssues {
+  const blocking: string[] = []
+  const warnings: string[] = []
+  const speakerIds = new Set(input.speakers.map((speaker) => speaker.id))
+
+  if (input.segments.length === 0) blocking.push('没有可导出的说话片段')
+  if (!input.media) warnings.push('未加载媒体文件，导出的工程 JSON 会缺少媒体来源')
+  if (!input.rttm) warnings.push('未加载 RTTM 主文件，当前片段可能不是从标准说话人时间轴开始')
+  if (!input.srt) warnings.push('未加载 SRT 字幕，文本校对缺少字幕上下文')
+  if (!input.candidateFile) warnings.push('未加载 subseg_match_results.json，声纹/人脸候选证据不可见')
+
+  const pendingCount = input.segments.filter((segment) => (segment.reviewStatus || 'pending') === 'pending').length
+  const emptyInsertedCount = input.segments.filter((segment) => (
+    segment.reviewStatus === 'inserted' && !(segment.text || segment.evidence?.text?.value || '').trim()
+  )).length
+  const invalidTimeCount = input.segments.filter((segment) => (
+    !Number.isFinite(segment.start) || !Number.isFinite(segment.end) || segment.end <= segment.start
+  )).length
+  const missingSpeakerCount = input.segments.filter((segment) => (
+    input.speakers.length > 0 && !speakerIds.has(segment.speakerId)
+  )).length
+
+  if (invalidTimeCount > 0) blocking.push(`${invalidTimeCount} 条片段时间不合法`)
+  if (missingSpeakerCount > 0) blocking.push(`${missingSpeakerCount} 条片段引用了不存在的说话人`)
+  if (pendingCount > 0) warnings.push(`${pendingCount} 条片段仍是 pending`)
+  if (emptyInsertedCount > 0) warnings.push(`${emptyInsertedCount} 条人工插入片段还没有填写文本`)
+  if (input.waveMissingRanges.length > 0) warnings.push(`波峰仍提示 ${input.waveMissingRanges.length} 个疑似遗漏区间`)
+
+  const selectedEpisode = episodeLabelFromId(input.selectedEpisodeId)
+  const fileNames = [input.media?.name, input.rttm?.name, input.srt?.name, input.candidateFile?.name].filter(Boolean)
+  if (fileNames.some((name) => !fileMatchesEpisode(name, input.selectedEpisodeId))) {
+    warnings.push(`已选 ${selectedEpisode}，但部分源文件名不像这一集`)
+  }
+
+  return { blocking, warnings }
+}
+
 
 
 function formatTime(sec:number){
@@ -407,6 +511,18 @@ export default function App(){
   const [confirmDelete, setConfirmDelete] = useState<{open: boolean; segId: string} | null>(null)
   const lastDeletedRef = useRef<Segment | null>(null)
   const [toast, setToast] = useState<{message: string; actionLabel?: string; onAction?: ()=>void} | null>(null)
+  const historyRef = useRef<AnnotationSnapshot[]>([])
+  const historyCursorRef = useRef(-1)
+  const historySkipRef = useRef(false)
+  const lastHistorySignatureRef = useRef('')
+  const [historyCursor, setHistoryCursor] = useState(-1)
+  const [historyLength, setHistoryLength] = useState(0)
+  const [lastDraftSavedAt, setLastDraftSavedAt] = useState<string | null>(null)
+  const [draftAvailable, setDraftAvailable] = useState(false)
+  const [exportIssues, setExportIssues] = useState<ExportIssues | null>(null)
+  const draftStorageKey = useMemo(() => `e2cp-rttm-workbench-draft-${selectedEpisodeId}`, [selectedEpisodeId])
+  const canUndo = historyCursor > 0
+  const canRedo = historyLength > 0 && historyCursor >= 0 && historyCursor < historyLength - 1
   const [playbackRate, setPlaybackRate] = useState<number>(1.0); // 默认 1x
 
   useEffect(()=>{
@@ -421,6 +537,135 @@ export default function App(){
       window.removeEventListener('keydown', onKey)
     }
   }, [])
+
+  const restoreAnnotationSnapshot = useCallback((snapshot: AnnotationSnapshot) => {
+    const restored = buildAnnotationSnapshot(snapshot.segments, snapshot.speakers)
+    const signature = annotationSnapshotSignature(restored)
+    historySkipRef.current = true
+    lastHistorySignatureRef.current = signature
+    setSegments(restored.segments)
+    setSpeakers(restored.speakers)
+    setSelectedSegId((current) => (
+      current && restored.segments.some((segment) => segment.id === current)
+        ? current
+        : restored.segments[0]?.id ?? null
+    ))
+  }, [])
+
+  const undoAnnotation = useCallback(() => {
+    const current = historyCursorRef.current
+    if (current <= 0) return
+    const next = current - 1
+    historyCursorRef.current = next
+    setHistoryCursor(next)
+    restoreAnnotationSnapshot(historyRef.current[next])
+  }, [restoreAnnotationSnapshot])
+
+  const redoAnnotation = useCallback(() => {
+    const current = historyCursorRef.current
+    const next = current + 1
+    if (next < 0 || next >= historyRef.current.length) return
+    historyCursorRef.current = next
+    setHistoryCursor(next)
+    restoreAnnotationSnapshot(historyRef.current[next])
+  }, [restoreAnnotationSnapshot])
+
+  useEffect(() => {
+    const snapshot = buildAnnotationSnapshot(segments, speakers)
+    if (snapshot.segments.length === 0 && snapshot.speakers.length === 0 && historyRef.current.length === 0) return
+    const signature = annotationSnapshotSignature(snapshot)
+    if (historySkipRef.current) {
+      historySkipRef.current = false
+      lastHistorySignatureRef.current = signature
+      return
+    }
+    if (signature === lastHistorySignatureRef.current) return
+
+    const base = historyRef.current.slice(0, historyCursorRef.current + 1)
+    base.push(snapshot)
+    const nextHistory = base.length > MAX_HISTORY_STEPS ? base.slice(base.length - MAX_HISTORY_STEPS) : base
+    historyRef.current = nextHistory
+    historyCursorRef.current = nextHistory.length - 1
+    lastHistorySignatureRef.current = signature
+    setHistoryCursor(historyCursorRef.current)
+    setHistoryLength(nextHistory.length)
+  }, [segments, speakers])
+
+  useEffect(() => {
+    try {
+      setDraftAvailable(Boolean(window.localStorage.getItem(draftStorageKey)))
+    } catch {
+      setDraftAvailable(false)
+    }
+  }, [draftStorageKey])
+
+  useEffect(() => {
+    if (segments.length === 0 && speakers.length === 0) return
+    const savedAt = new Date().toISOString()
+    const payload: DraftPayload = {
+      schemaVersion: DRAFT_SCHEMA_VERSION,
+      savedAt,
+      selectedEpisodeId,
+      selectedSegId,
+      sourceFiles: {
+        media: media?.name,
+        rttm: rttm?.name,
+        refRTTM: refRTTM?.name,
+        srt: srt?.name,
+        candidate: candidateFile?.name,
+      },
+      ...buildAnnotationSnapshot(segments, speakers),
+    }
+    const timer = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(draftStorageKey, JSON.stringify(payload))
+        setLastDraftSavedAt(savedAt)
+        setDraftAvailable(true)
+      } catch {
+        setToast({ message: '自动草稿保存失败：浏览器本地存储空间不足或不可用' })
+        window.setTimeout(() => setToast(null), 4500)
+      }
+    }, 700)
+    return () => window.clearTimeout(timer)
+  }, [candidateFile?.name, draftStorageKey, media?.name, refRTTM?.name, rttm?.name, selectedEpisodeId, selectedSegId, segments, speakers, srt?.name])
+
+  const restoreDraft = useCallback(() => {
+    try {
+      const raw = window.localStorage.getItem(draftStorageKey)
+      if (!raw) {
+        setToast({ message: '没有可恢复的本地草稿' })
+        window.setTimeout(() => setToast(null), 3000)
+        return
+      }
+      const payload = JSON.parse(raw) as DraftPayload
+      if (payload.schemaVersion !== DRAFT_SCHEMA_VERSION) {
+        setToast({ message: '草稿版本不兼容，无法恢复' })
+        window.setTimeout(() => setToast(null), 4500)
+        return
+      }
+      restoreAnnotationSnapshot(payload)
+      setLastDraftSavedAt(payload.savedAt)
+      setSelectedSegId(payload.selectedSegId)
+      setToast({ message: `已恢复 ${episodeLabelFromId(payload.selectedEpisodeId)} 的本地草稿` })
+      window.setTimeout(() => setToast(null), 3500)
+    } catch (error) {
+      setToast({ message: `恢复草稿失败：${error instanceof Error ? error.message : '未知错误'}` })
+      window.setTimeout(() => setToast(null), 4500)
+    }
+  }, [draftStorageKey, restoreAnnotationSnapshot])
+
+  const clearDraft = useCallback(() => {
+    try {
+      window.localStorage.removeItem(draftStorageKey)
+      setDraftAvailable(false)
+      setLastDraftSavedAt(null)
+      setToast({ message: '已清除当前剧集的本地草稿' })
+      window.setTimeout(() => setToast(null), 3000)
+    } catch {
+      setToast({ message: '清除草稿失败：浏览器本地存储不可用' })
+      window.setTimeout(() => setToast(null), 3500)
+    }
+  }, [draftStorageKey])
 
   // drag-n-drop upload (global)
   const [dragOver, setDragOver] = useState(false)
@@ -812,6 +1057,24 @@ export default function App(){
   // keyboard
   useEffect(()=>{
     const onKey = (e: KeyboardEvent) => {
+      const active = document.activeElement as HTMLElement | null
+      const isEditable = !!active && (
+        active.tagName === 'INPUT' ||
+        active.tagName === 'TEXTAREA' ||
+        active.isContentEditable ||
+        !!active.closest('input, textarea, [contenteditable="true"]')
+      )
+      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !isEditable){
+        e.preventDefault()
+        if(e.shiftKey) redoAnnotation()
+        else undoAnnotation()
+        return
+      }
+      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !isEditable){
+        e.preventDefault()
+        redoAnnotation()
+        return
+      }
       if(e.code === 'Space'){ console.log('Space'); e.preventDefault(); togglePlay() }
       if(e.key === 'ArrowLeft'){ console.log('ArrowLeft'); seek(currentTime - 1) }
       if(e.key === 'ArrowRight'){ console.log('ArrowRight'); seek(currentTime + 1) }
@@ -820,13 +1083,6 @@ export default function App(){
       if(e.key === 'Delete' || e.key === 'Backspace'){
         console.log('Delete/Backspace pressed, selectedSegId=', selectedSegId)
         // Ignore Delete when user is typing in an editable element
-        const active = document.activeElement as HTMLElement | null
-        const isEditable = !!active && (
-          active.tagName === 'INPUT' ||
-          active.tagName === 'TEXTAREA' ||
-          active.isContentEditable ||
-          !!active.closest('input, textarea, [contenteditable="true"]')
-        )
         if(isEditable){ console.log('Editable focused, skip'); return }
         if(selectedSegId && !confirmDelete){
           e.preventDefault();
@@ -844,7 +1100,7 @@ export default function App(){
     }
     window.addEventListener('keydown', onKey)
     return ()=> window.removeEventListener('keydown', onKey)
-  }, [currentTime, duration, selectedSegId, confirmDelete])
+  }, [currentTime, duration, selectedSegId, confirmDelete, redoAnnotation, undoAnnotation])
 
   // timeline dims
   const pxPerSec = 80 * zoom
@@ -1064,8 +1320,33 @@ export default function App(){
   // tooltip on hover segment
   const [tooltip, setTooltip] = useState<{x:number;y:number;text:string}|null>(null)
 
+  const validateBeforeExport = (target: string) => {
+    const issues = buildExportIssues({
+      segments,
+      speakers,
+      media,
+      rttm,
+      srt,
+      candidateFile,
+      selectedEpisodeId,
+      waveMissingRanges,
+    })
+    setExportIssues(issues)
+    if (issues.blocking.length > 0) {
+      setToast({ message: `${target} 导出已停止：${issues.blocking[0]}` })
+      window.setTimeout(() => setToast(null), 5000)
+      return false
+    }
+    if (issues.warnings.length > 0) {
+      setToast({ message: `${target} 已通过基础校验，但仍有 ${issues.warnings.length} 条提醒` })
+      window.setTimeout(() => setToast(null), 4200)
+    }
+    return true
+  }
+
   // export project (segments + speakers) JSON
   const exportJSON = () => {
+    if (!validateBeforeExport('工程 JSON')) return
     const data = buildEpisodeProject({
       media: media ? { ...media, duration } : null,
       rttm,
@@ -1086,6 +1367,7 @@ export default function App(){
   }
 
   const exportRTTM = () => {
+    if (!validateBeforeExport('RTTM')) return
     const fileId = media?.name ? media.name.replace(/\.[^/.]+$/, '') : 'unknown'
     const lines = segments
       .slice()
@@ -1398,6 +1680,29 @@ export default function App(){
                   <span>inserted {reviewProgress.counts.inserted}</span>
                   <span>uncertain {reviewProgress.counts.uncertain}</span>
                 </div>
+              </div>
+              <div className="safety-card">
+                <div className="row" style={{justifyContent:'space-between'}}>
+                  <strong>安全状态</strong>
+                  <span className="badge-sm">历史 {historyLength === 0 ? 0 : historyCursor + 1} / {historyLength}</span>
+                </div>
+                <div className="safety-line">
+                  自动草稿：{formatSavedAt(lastDraftSavedAt)}
+                </div>
+                <div className="safety-actions">
+                  <button className="btn tiny" disabled={!canUndo} onClick={undoAnnotation}>撤销</button>
+                  <button className="btn tiny" disabled={!canRedo} onClick={redoAnnotation}>重做</button>
+                  <button className="btn tiny" disabled={!draftAvailable} onClick={restoreDraft}>恢复草稿</button>
+                  <button className="btn tiny" disabled={!draftAvailable} onClick={clearDraft}>清除草稿</button>
+                </div>
+                {exportIssues && (
+                  <div className={`export-check ${exportIssues.blocking.length > 0 ? 'blocked' : 'warning'}`}>
+                    <div>导出校验：{exportIssues.blocking.length > 0 ? '未通过' : '可导出'}</div>
+                    {[...exportIssues.blocking, ...exportIssues.warnings].slice(0, 4).map((item) => (
+                      <div key={item}>- {item}</div>
+                    ))}
+                  </div>
+                )}
               </div>
               {currentEpisodeLabel !== '未识别' && currentEpisodeLabel !== episodeLabelFromId(selectedEpisodeId) && (
                 <div className="wizard-warning">
