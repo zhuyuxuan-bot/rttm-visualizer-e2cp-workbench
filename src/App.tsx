@@ -450,6 +450,7 @@ export default function App(){
   const dragRef = useRef<{ type: 'start'|'end'|'move'|'create'; speakerId: string; segId?: string; anchorTime?: number } | null>(null)
   const [dragTip, setDragTip] = useState<{x:number;y:number;text:string}|null>(null)
   const segmentsRef = useRef<Segment[]>([])
+  const trackRefs = useRef<Map<string, HTMLDivElement>>(new Map())
   useEffect(()=>{ segmentsRef.current = segments }, [segments])
   const selectedSegment = useMemo(
     () => segments.find((segment) => segment.id === selectedSegId) ?? null,
@@ -459,6 +460,11 @@ export default function App(){
     () => speakers.find((speaker) => speaker.id === selectedSegment?.speakerId) ?? null,
     [speakers, selectedSegment?.speakerId],
   )
+  useEffect(() => {
+    if (!selectedSegment?.speakerId) return
+    const track = trackRefs.current.get(selectedSegment.speakerId)
+    track?.scrollIntoView({ block: 'nearest' })
+  }, [selectedSegment?.speakerId, speakers.length])
   const selectedCandidate = useMemo(() => {
     if (!selectedSegment || !candidateFile?.entries.length) return null
     let best: { entry: CandidateEntry; overlap: number } | null = null
@@ -1753,29 +1759,6 @@ export default function App(){
                   <span>uncertain {reviewProgress.counts.uncertain}</span>
                 </div>
               </div>
-              <div className="safety-card">
-                <div className="row" style={{justifyContent:'space-between'}}>
-                  <strong>安全状态</strong>
-                  <span className="badge-sm">历史 {historyLength === 0 ? 0 : historyCursor + 1} / {historyLength}</span>
-                </div>
-                <div className="safety-line">
-                  自动草稿：{formatSavedAt(lastDraftSavedAt)}
-                </div>
-                <div className="safety-actions">
-                  <button className="btn tiny" disabled={!canUndo} onClick={undoAnnotation}>撤销</button>
-                  <button className="btn tiny" disabled={!canRedo} onClick={redoAnnotation}>重做</button>
-                  <button className="btn tiny" disabled={!draftAvailable} onClick={restoreDraft}>恢复草稿</button>
-                  <button className="btn tiny" disabled={!draftAvailable} onClick={clearDraft}>清除草稿</button>
-                </div>
-                {exportIssues && (
-                  <div className={`export-check ${exportIssues.blocking.length > 0 ? 'blocked' : 'warning'}`}>
-                    <div>导出校验：{exportIssues.blocking.length > 0 ? '未通过' : '可导出'}</div>
-                    {[...exportIssues.blocking, ...exportIssues.warnings].slice(0, 4).map((item) => (
-                      <div key={item}>- {item}</div>
-                    ))}
-                  </div>
-                )}
-              </div>
               {currentEpisodeLabel !== '未识别' && currentEpisodeLabel !== episodeLabelFromId(selectedEpisodeId) && (
                 <div className="wizard-warning">
                   当前已加载文件更像 {currentEpisodeLabel}，但你选择的是 {episodeLabelFromId(selectedEpisodeId)}。如果要标注新剧集，请重新上传对应文件。
@@ -2128,10 +2111,16 @@ export default function App(){
                 >
                   {allTracks.map(spk => {
                     const hidden = speakers.length > 0 ? !spk.visible : false
+                    const trackSegments = speakers.length > 0 ? segments.filter(s => s.speakerId === spk.id) : []
+                    const isSelectedTrack = selectedSegment?.speakerId === spk.id
                     return (
                       <div
                         key={spk.id}
-                        className="track"
+                        ref={(node) => {
+                          if (node) trackRefs.current.set(spk.id, node)
+                          else trackRefs.current.delete(spk.id)
+                        }}
+                        className={`track${isSelectedTrack ? ' selected-track' : ''}`}
                         title={spk.name} // 👈 悬停显示说话人名
                         style={{
                           width: '100%',
@@ -2172,8 +2161,15 @@ export default function App(){
                             }}
                           />
                         )}
-                        {speakers.length > 0 ?
-                          segments.filter(s => s.speakerId === spk.id).map(seg => {
+                        {speakers.length > 0 ? (
+                          <>
+                            {trackSegments.length === 0 && (
+                              <div className="empty-track-hint">
+                                <span style={{ background: spk.color }} />
+                                点击此轨道插入 {spk.name} 的片段
+                              </div>
+                            )}
+                            {trackSegments.map(seg => {
                             const left = seg.start * pxPerSec
                             const w = (seg.end - seg.start) * pxPerSec
                             const isActive = currentTime >= seg.start && currentTime < seg.end
@@ -2246,7 +2242,9 @@ export default function App(){
                                 />
                               </div>
                             );
-                          }) :
+                            })}
+                          </>
+                        ) :
                           <div style={{
                             position: 'absolute',
                             left: '10px',
