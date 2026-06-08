@@ -1,7 +1,14 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Eye, EyeOff, FileAudio, FileVideo, FileText, Download, Subtitles, Github, Plus, Trash2 } from 'lucide-react'
+import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Download, Github, Plus } from 'lucide-react'
 import { computeDER, type ErrorInterval, type DERMetrics } from './utils'
 import { buildEpisodeProject, type ReviewStatus, type SegmentEvidence, type SegmentType } from './reviewSchema'
+import {
+  applyMissingTimePoint,
+  applyMissingTimeRange,
+  type MissingTimePickMode,
+} from './missingInsertSelection'
+import { sanitizeNonJsonNumericTokens } from './candidateJsonSanitizer'
+import { stripSpeakerPrefix } from './dialogueText'
 
 type MediaType = 'audio' | 'video'
 
@@ -112,7 +119,11 @@ interface ExportIssues {
 }
 
 const DRAFT_SCHEMA_VERSION = 'e2cp.rttm_workbench.draft.v1' as const
+const LAST_EPISODE_STORAGE_KEY = 'e2cp-rttm-workbench-last-episode'
 const MAX_HISTORY_STEPS = 80
+const DIALOGUE_ROW_HEIGHT = 76
+const DIALOGUE_OVERSCAN_ROWS = 12
+type WorkMode = 'prepare' | 'annotate'
 
 function cloneSegments(segments: Segment[]): Segment[] {
   return segments.map((segment) => ({
@@ -136,6 +147,12 @@ function buildAnnotationSnapshot(segments: Segment[], speakers: Speaker[]): Anno
 
 function annotationSnapshotSignature(snapshot: AnnotationSnapshot): string {
   return JSON.stringify(snapshot)
+}
+
+function parseDraftPayload(raw: string | null): DraftPayload | null {
+  if (!raw) return null
+  const payload = JSON.parse(raw) as DraftPayload
+  return payload.schemaVersion === DRAFT_SCHEMA_VERSION ? payload : null
 }
 
 function formatSavedAt(value: string | null): string {
@@ -210,6 +227,27 @@ function formatHMSms(seconds: number){
   } else {
     return `${sign}${minutes}:${secs.toFixed(1).padStart(4,'0')}`
   }
+}
+
+function findBestSubtitleForSegment(segment: Segment | null | undefined, subtitles: Subtitle[]): Subtitle | null {
+  if (!segment || subtitles.length === 0) return null
+  let best: { subtitle: Subtitle; score: number } | null = null
+  const segmentMidpoint = (segment.start + segment.end) / 2
+
+  for (const subtitle of subtitles) {
+    if (subtitle.end < segment.start - 0.25) continue
+    if (subtitle.start > segment.end + 0.25) break
+
+    const overlap = Math.max(0, Math.min(segment.end, subtitle.end) - Math.max(segment.start, subtitle.start))
+    const subtitleMidpointInside = segmentMidpoint >= subtitle.start && segmentMidpoint <= subtitle.end
+    const score = overlap + (subtitleMidpointInside ? 0.05 : 0)
+
+    if (score > 0.03 && (!best || score > best.score)) {
+      best = { subtitle, score }
+    }
+  }
+
+  return best?.subtitle ?? null
 }
 
 function parseSRT(text: string): Subtitle[] {
@@ -342,6 +380,15 @@ function episodeLabelFromId(value: string): string {
   return `EP${normalizeEpisodeId(value)}`
 }
 
+function getInitialEpisodeId(): string {
+  if (typeof window === 'undefined') return '02'
+  try {
+    return normalizeEpisodeId(window.localStorage.getItem(LAST_EPISODE_STORAGE_KEY) || '02')
+  } catch {
+    return '02'
+  }
+}
+
 function fileMatchesEpisode(name: string | undefined, episodeId: string): boolean {
   if (!name) return false
   const normalized = normalizeEpisodeId(episodeId)
@@ -364,21 +411,54 @@ function normalizeCandidateFace(raw: unknown): CandidateFace {
   }
 }
 
-function parseCandidateJSON(text: string): CandidateEntry[] {
-  const parsed = JSON.parse(text) as unknown
+function getCandidateItems(parsed: unknown): Array<readonly [string, unknown]> {
+  if (Array.isArray(parsed)) {
+    return parsed.map((value, index) => [`item_${index + 1}`, value] as const)
+  }
+
   const root = asRecord(parsed)
-  const items = Array.isArray(parsed)
-    ? parsed.map((value, index) => [`item_${index + 1}`, value] as const)
-    : root
-      ? Object.entries(root)
-      : []
+  if (!root) return []
+
+  const wrappedKeys = ['results', 'segments', 'items', 'data', 'matches']
+  for (const wrappedKey of wrappedKeys) {
+    const wrappedValue = root[wrappedKey]
+    if (Array.isArray(wrappedValue)) {
+      return wrappedValue.map((value, index) => [`${wrappedKey}_${index + 1}`, value] as const)
+    }
+    const wrappedRecord = asRecord(wrappedValue)
+    if (wrappedRecord) {
+      return Object.entries(wrappedRecord)
+    }
+  }
+
+  return Object.entries(root)
+}
+
+function extractTimesFromRangeValue(value: unknown): { start?: number; end?: number } {
+  if (typeof value === 'string') return extractTimesFromKey(value)
+  if (Array.isArray(value)) {
+    return {
+      start: toNumber(value[0]),
+      end: toNumber(value[1]),
+    }
+  }
+  const record = asRecord(value)
+  if (!record) return {}
+  return {
+    start: toNumber(record.start ?? record.start_time ?? record.startTime),
+    end: toNumber(record.end ?? record.end_time ?? record.endTime),
+  }
+}
+
+function parseCandidateJSON(text: string): CandidateEntry[] {
+  const parsed = JSON.parse(sanitizeNonJsonNumericTokens(text)) as unknown
+  const items = getCandidateItems(parsed)
 
   return items.flatMap(([key, value], index) => {
     const record = asRecord(value)
     if (!record) return []
     const timeFromKey = extractTimesFromKey(key)
-    const timeRange = pickString(record, ['time_range', 'timeRange', 'range'])
-    const timeFromRange = timeRange ? extractTimesFromKey(timeRange) : {}
+    const timeFromRange = extractTimesFromRangeValue(record.time_range ?? record.timeRange ?? record.range)
     const start = toNumber(record.start ?? record.start_time ?? record.startTime) ?? timeFromRange.start ?? timeFromKey.start
     const end = toNumber(record.end ?? record.end_time ?? record.endTime) ?? timeFromRange.end ?? timeFromKey.end
     const top5SpeakersRaw = record.top_5_speakers ?? record.top5_speakers ?? record.top5Speakers ?? record.speakers
@@ -412,13 +492,56 @@ const SUBTITLE_TRACK_HEIGHT = 48
 const WAVEFORM_POINTS_PER_SEC = 50
 const WAVEFORM_MAX_CHUNK_WIDTH = 3000
 
-export default function App(){
+interface AppErrorBoundaryState {
+  error: Error | null
+}
+
+class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = { error: null }
+
+  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+    return { error }
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('RTTM visualizer runtime error:', error)
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="app-error-boundary notranslate" translate="no">
+          <div className="app-error-card">
+            <h1>RTTM 可视化器发生运行时错误</h1>
+            <p>界面没有丢失数据。若反复出现 insertBefore，请先关闭浏览器翻译或会改写页面文字的插件，再点击按钮尝试恢复界面。</p>
+            <pre>{this.state.error.message}</pre>
+            <button className="btn tiny primary-action" onClick={() => this.setState({ error: null })}>
+              尝试恢复界面
+            </button>
+          </div>
+        </div>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
+function AppContent(){
   const [title] = useState('RTTM Visualizer') // 1) Title updated
   const videoRef = useRef<HTMLVideoElement>(null)
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
   const [zoom, setZoom] = useState(1)
+
+  useEffect(() => {
+    document.documentElement.lang = 'zh-CN'
+    document.documentElement.classList.add('notranslate')
+    document.documentElement.setAttribute('translate', 'no')
+    document.body.classList.add('notranslate')
+    document.body.setAttribute('translate', 'no')
+  }, [])
   const [media, setMedia] = useState<MediaFile|null>({ id:'sample', name:'sample.mp4', type:'video', url: sampleVideo })
   const [waveformSource, setWaveformSource] = useState<{url: string; name: string} | null>(null)
   const [rttm, setRTTM] = useState<RTTMFile|null>(null)
@@ -435,23 +558,56 @@ export default function App(){
   const [showRefTrack, setShowRefTrack] = useState<boolean>(true)
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(false)
-  const [selectedEpisodeId, setSelectedEpisodeId] = useState('02')
+  const [workMode, setWorkMode] = useState<WorkMode>('prepare')
+  const [followPlayback, setFollowPlayback] = useState(true)
+  const [quickSpeakerOpen, setQuickSpeakerOpen] = useState(false)
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState(getInitialEpisodeId)
   const episodeManuallySelectedRef = useRef(false)
+  const resourcePanelManuallyChangedRef = useRef(false)
+  const hasAutoEnteredAnnotationRef = useRef(false)
   const centerRef = useRef<HTMLDivElement>(null)
   const [videoAreaHeight, setVideoAreaHeight] = useState<number>(400)
   const resizeStateRef = useRef<{startY:number; startH:number} | null>(null)
   const isScrubbingRef = useRef(false)
   const defaultLoadedRef = useRef(false)
+  const bootDraftCheckedRef = useRef(false)
+  const bootDraftRestoredRef = useRef(false)
   const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
   const [newSpeakerName, setNewSpeakerName] = useState('')
-  const [followSubtitle, setFollowSubtitle] = useState(false)
+  const [segmentTextDraft, setSegmentTextDraft] = useState('')
+  const [segmentNotesDraft, setSegmentNotesDraft] = useState('')
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [missingInsertDraft, setMissingInsertDraft] = useState({ start: '', end: '', text: '', speakerId: '' })
+  const [missingPickMode, setMissingPickMode] = useState<MissingTimePickMode>('idle')
+  const [missingRangePreview, setMissingRangePreview] = useState<{ start: number; end: number } | null>(null)
+  const missingRangeAnchorRef = useRef<number | null>(null)
+  const [timeProbe, setTimeProbe] = useState<{ time: number; clientX: number; speakerName?: string } | null>(null)
+  const lastTimeProbeRef = useRef<{ time: number; speakerName?: string } | null>(null)
+  const segmentTextCommitTimerRef = useRef<number | null>(null)
+  const segmentNotesCommitTimerRef = useRef<number | null>(null)
+  const pendingSegmentTextCommitRef = useRef<{ segmentId: string; value: string } | null>(null)
+  const pendingSegmentNotesCommitRef = useRef<{ segmentId: string; value: string } | null>(null)
+  const timeProbeFrameRef = useRef<number | null>(null)
+  const pendingTimeProbeRef = useRef<{ time: number; clientX: number; speakerName?: string } | null>(null)
+  const missingRangePreviewFrameRef = useRef<number | null>(null)
+  const pendingMissingRangePreviewRef = useRef<{ start: number; end: number } | null>(null)
+  const ghostSegFrameRef = useRef<number | null>(null)
+  const pendingGhostSegRef = useRef<{speakerId:string; start:number; end:number} | null>(null)
+  const lastGhostSegRef = useRef<{speakerId:string; start:number; end:number} | null>(null)
+  const suppressTimelineClickRef = useRef(false)
+  const timelineScrollbarDragRef = useRef(false)
   const dragRef = useRef<{ type: 'start'|'end'|'move'|'create'; speakerId: string; segId?: string; anchorTime?: number } | null>(null)
   const [dragTip, setDragTip] = useState<{x:number;y:number;text:string}|null>(null)
   const segmentsRef = useRef<Segment[]>([])
+  const speakersRef = useRef<Speaker[]>([])
   const trackRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const dialogueListRef = useRef<HTMLDivElement>(null)
+  const [dialogueScrollTop, setDialogueScrollTop] = useState(0)
+  const [dialogueViewportHeight, setDialogueViewportHeight] = useState(480)
+  const autoDialogueScrollingRef = useRef(false)
+  const releaseAutoDialogueScrollRef = useRef<number | null>(null)
   useEffect(()=>{ segmentsRef.current = segments }, [segments])
+  useEffect(()=>{ speakersRef.current = speakers }, [speakers])
   const selectedSegment = useMemo(
     () => segments.find((segment) => segment.id === selectedSegId) ?? null,
     [segments, selectedSegId],
@@ -460,6 +616,22 @@ export default function App(){
     () => speakers.find((speaker) => speaker.id === selectedSegment?.speakerId) ?? null,
     [speakers, selectedSegment?.speakerId],
   )
+  const speakerTextLabels = useMemo(
+    () => Array.from(new Set(speakers.flatMap((speaker) => [speaker.name, speaker.id]).filter(Boolean))),
+    [speakers],
+  )
+  const segmentsBySpeaker = useMemo(() => {
+    const map = new Map<string, Segment[]>()
+    for (const segment of segments) {
+      const list = map.get(segment.speakerId)
+      if (list) list.push(segment)
+      else map.set(segment.speakerId, [segment])
+    }
+    return map
+  }, [segments])
+  useEffect(() => {
+    setQuickSpeakerOpen(false)
+  }, [selectedSegId])
   useEffect(() => {
     if (!selectedSegment?.speakerId) return
     const track = trackRefs.current.get(selectedSegment.speakerId)
@@ -492,9 +664,88 @@ export default function App(){
         : segment
     )))
   }, [selectedSegId])
-  const markSelectedAsChecked = useCallback(() => {
-    updateSelectedSegment({ reviewStatus: 'checked' })
-  }, [updateSelectedSegment])
+  const commitSegmentTextToSegment = useCallback((segmentId: string, value: string) => {
+    setSegments((prev) => prev.map((segment) => (
+      segment.id === segmentId
+        ? {
+            ...segment,
+            text: value,
+            evidence: {
+              ...segment.evidence,
+              text: { source: 'manual', value },
+            },
+            reviewStatus: segment.reviewStatus === 'pending' ? 'corrected' : segment.reviewStatus,
+          }
+        : segment
+    )))
+  }, [])
+  const commitSegmentNotesToSegment = useCallback((segmentId: string, value: string) => {
+    setSegments((prev) => prev.map((segment) => (
+      segment.id === segmentId
+        ? { ...segment, notes: value }
+        : segment
+    )))
+  }, [])
+  const scheduleSegmentTextCommit = useCallback((value: string) => {
+    setSegmentTextDraft(value)
+    if (!selectedSegId) return
+    const pending = pendingSegmentTextCommitRef.current
+    if (segmentTextCommitTimerRef.current !== null) {
+      window.clearTimeout(segmentTextCommitTimerRef.current)
+      segmentTextCommitTimerRef.current = null
+    }
+    if (pending && pending.segmentId !== selectedSegId) {
+      commitSegmentTextToSegment(pending.segmentId, pending.value)
+    }
+    pendingSegmentTextCommitRef.current = { segmentId: selectedSegId, value }
+    segmentTextCommitTimerRef.current = window.setTimeout(() => {
+      const latest = pendingSegmentTextCommitRef.current
+      pendingSegmentTextCommitRef.current = null
+      segmentTextCommitTimerRef.current = null
+      if (latest) commitSegmentTextToSegment(latest.segmentId, latest.value)
+    }, 450)
+  }, [commitSegmentTextToSegment, selectedSegId])
+  const scheduleSegmentNotesCommit = useCallback((value: string) => {
+    setSegmentNotesDraft(value)
+    if (!selectedSegId) return
+    const pending = pendingSegmentNotesCommitRef.current
+    if (segmentNotesCommitTimerRef.current !== null) {
+      window.clearTimeout(segmentNotesCommitTimerRef.current)
+      segmentNotesCommitTimerRef.current = null
+    }
+    if (pending && pending.segmentId !== selectedSegId) {
+      commitSegmentNotesToSegment(pending.segmentId, pending.value)
+    }
+    pendingSegmentNotesCommitRef.current = { segmentId: selectedSegId, value }
+    segmentNotesCommitTimerRef.current = window.setTimeout(() => {
+      const latest = pendingSegmentNotesCommitRef.current
+      pendingSegmentNotesCommitRef.current = null
+      segmentNotesCommitTimerRef.current = null
+      if (latest) commitSegmentNotesToSegment(latest.segmentId, latest.value)
+    }, 450)
+  }, [commitSegmentNotesToSegment, selectedSegId])
+  const flushPendingSegmentText = useCallback(() => {
+    if (segmentTextCommitTimerRef.current !== null) {
+      window.clearTimeout(segmentTextCommitTimerRef.current)
+      segmentTextCommitTimerRef.current = null
+    }
+    const pending = pendingSegmentTextCommitRef.current
+    pendingSegmentTextCommitRef.current = null
+    if (pending) commitSegmentTextToSegment(pending.segmentId, pending.value)
+  }, [commitSegmentTextToSegment])
+  const flushPendingSegmentNotes = useCallback(() => {
+    if (segmentNotesCommitTimerRef.current !== null) {
+      window.clearTimeout(segmentNotesCommitTimerRef.current)
+      segmentNotesCommitTimerRef.current = null
+    }
+    const pending = pendingSegmentNotesCommitRef.current
+    pendingSegmentNotesCommitRef.current = null
+    if (pending) commitSegmentNotesToSegment(pending.segmentId, pending.value)
+  }, [commitSegmentNotesToSegment])
+  useEffect(() => {
+    setSegmentTextDraft(selectedSegment?.text || '')
+    setSegmentNotesDraft(selectedSegment?.notes || '')
+  }, [selectedSegment?.id, selectedSegment?.notes, selectedSegment?.text])
   const addSpeaker = useCallback((name?: string, source: Speaker['source'] = 'manual') => {
     const trimmed = (name || newSpeakerName || '').trim()
     const baseName = trimmed || `speaker${speakers.length + 1}`
@@ -531,6 +782,14 @@ export default function App(){
   const canUndo = historyCursor > 0
   const canRedo = historyLength > 0 && historyCursor >= 0 && historyCursor < historyLength - 1
   const [playbackRate, setPlaybackRate] = useState<number>(1.0); // 默认 1x
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LAST_EPISODE_STORAGE_KEY, selectedEpisodeId)
+    } catch {
+      // Local storage is only a convenience for resuming work.
+    }
+  }, [selectedEpisodeId])
 
   useEffect(()=>{
     const closeMenu = () => setCtxMenu(null)
@@ -600,30 +859,38 @@ export default function App(){
 
   useEffect(() => {
     try {
-      setDraftAvailable(Boolean(window.localStorage.getItem(draftStorageKey)))
+      const payload = parseDraftPayload(window.localStorage.getItem(draftStorageKey))
+      setDraftAvailable(Boolean(payload))
+      if (payload) {
+        setLastDraftSavedAt(payload.savedAt)
+      } else {
+        setLastDraftSavedAt(null)
+      }
     } catch {
       setDraftAvailable(false)
+      setLastDraftSavedAt(null)
     }
   }, [draftStorageKey])
 
   useEffect(() => {
+    if (!bootDraftCheckedRef.current) return
     if (segments.length === 0 && speakers.length === 0) return
-    const savedAt = new Date().toISOString()
-    const payload: DraftPayload = {
-      schemaVersion: DRAFT_SCHEMA_VERSION,
-      savedAt,
-      selectedEpisodeId,
-      selectedSegId,
-      sourceFiles: {
-        media: media?.name,
-        rttm: rttm?.name,
-        refRTTM: refRTTM?.name,
-        srt: srt?.name,
-        candidate: candidateFile?.name,
-      },
-      ...buildAnnotationSnapshot(segments, speakers),
-    }
     const timer = window.setTimeout(() => {
+      const savedAt = new Date().toISOString()
+      const payload: DraftPayload = {
+        schemaVersion: DRAFT_SCHEMA_VERSION,
+        savedAt,
+        selectedEpisodeId,
+        selectedSegId,
+        sourceFiles: {
+          media: media?.name,
+          rttm: rttm?.name,
+          refRTTM: refRTTM?.name,
+          srt: srt?.name,
+          candidate: candidateFile?.name,
+        },
+        ...buildAnnotationSnapshot(segmentsRef.current, speakersRef.current),
+      }
       try {
         window.localStorage.setItem(draftStorageKey, JSON.stringify(payload))
         setLastDraftSavedAt(savedAt)
@@ -636,43 +903,35 @@ export default function App(){
     return () => window.clearTimeout(timer)
   }, [candidateFile?.name, draftStorageKey, media?.name, refRTTM?.name, rttm?.name, selectedEpisodeId, selectedSegId, segments, speakers, srt?.name])
 
-  const restoreDraft = useCallback(() => {
+  const applyDraftPayload = useCallback((payload: DraftPayload, mode: 'auto' | 'manual') => {
+    restoreAnnotationSnapshot(payload)
+    setLastDraftSavedAt(payload.savedAt)
+    setDraftAvailable(true)
+    setSelectedSegId(payload.selectedSegId)
+    setToast({
+      message: mode === 'auto'
+        ? `已自动恢复 ${episodeLabelFromId(payload.selectedEpisodeId)} 的上次标注草稿`
+        : `已恢复 ${episodeLabelFromId(payload.selectedEpisodeId)} 的本地草稿`,
+    })
+    window.setTimeout(() => setToast(null), mode === 'auto' ? 4800 : 3500)
+  }, [restoreAnnotationSnapshot])
+
+  useEffect(() => {
+    if (bootDraftCheckedRef.current) return
+    bootDraftCheckedRef.current = true
     try {
-      const raw = window.localStorage.getItem(draftStorageKey)
-      if (!raw) {
-        setToast({ message: '没有可恢复的本地草稿' })
-        window.setTimeout(() => setToast(null), 3000)
-        return
+      const payload = parseDraftPayload(window.localStorage.getItem(draftStorageKey))
+      if (!payload) return
+      bootDraftRestoredRef.current = true
+      applyDraftPayload(payload, 'auto')
+      if (payload.sourceFiles.rttm) {
+        setRTTM({ id: 'draft-rttm', name: payload.sourceFiles.rttm, url: '', matched: true })
       }
-      const payload = JSON.parse(raw) as DraftPayload
-      if (payload.schemaVersion !== DRAFT_SCHEMA_VERSION) {
-        setToast({ message: '草稿版本不兼容，无法恢复' })
-        window.setTimeout(() => setToast(null), 4500)
-        return
-      }
-      restoreAnnotationSnapshot(payload)
-      setLastDraftSavedAt(payload.savedAt)
-      setSelectedSegId(payload.selectedSegId)
-      setToast({ message: `已恢复 ${episodeLabelFromId(payload.selectedEpisodeId)} 的本地草稿` })
-      window.setTimeout(() => setToast(null), 3500)
     } catch (error) {
-      setToast({ message: `恢复草稿失败：${error instanceof Error ? error.message : '未知错误'}` })
+      setToast({ message: `自动恢复草稿失败：${error instanceof Error ? error.message : '未知错误'}` })
       window.setTimeout(() => setToast(null), 4500)
     }
-  }, [draftStorageKey, restoreAnnotationSnapshot])
-
-  const clearDraft = useCallback(() => {
-    try {
-      window.localStorage.removeItem(draftStorageKey)
-      setDraftAvailable(false)
-      setLastDraftSavedAt(null)
-      setToast({ message: '已清除当前剧集的本地草稿' })
-      window.setTimeout(() => setToast(null), 3000)
-    } catch {
-      setToast({ message: '清除草稿失败：浏览器本地存储不可用' })
-      window.setTimeout(() => setToast(null), 3500)
-    }
-  }, [draftStorageKey])
+  }, [applyDraftPayload, draftStorageKey])
 
   // drag-n-drop upload (global)
   const [dragOver, setDragOver] = useState(false)
@@ -696,16 +955,27 @@ export default function App(){
         reader.onload = () => {
           try {
             const entries = parseCandidateJSON(String(reader.result))
+            if (entries.length === 0) {
+              throw new Error('没有解析到候选片段，请确认这是 subseg_match_results.json 或包含 top_5_speakers/top_5_faces 的 JSON')
+            }
             setCandidateFile({ id: crypto.randomUUID(), name: f.name, url, entries })
-            setToast({ message: `已载入候选匹配 JSON：${entries.length} 条` })
+            setToast({ message: `已载入 subseg JSON：${f.name}，候选片段 ${entries.length} 条` })
             window.setTimeout(()=>{ setToast(null) }, 3500)
           } catch (error) {
             URL.revokeObjectURL(url)
-            setToast({ message: `JSON 解析失败：${error instanceof Error ? error.message : '未知错误'}` })
+            setToast({ message: `subseg JSON 解析失败：${error instanceof Error ? error.message : '未知错误'}` })
             window.setTimeout(()=>{ setToast(null) }, 5000)
           }
         }
+        reader.onerror = () => {
+          URL.revokeObjectURL(url)
+          setToast({ message: `无法读取 JSON 文件：${f.name}` })
+          window.setTimeout(()=>{ setToast(null) }, 5000)
+        }
         reader.readAsText(f)
+      } else if(target === 'candidate'){
+        setToast({ message: 'subseg JSON 只能上传 .json 文件' })
+        window.setTimeout(()=>{ setToast(null) }, 3500)
       } else if(lowerName.endsWith('.rttm')){
         const url = URL.createObjectURL(f)
         const reader = new FileReader()
@@ -745,40 +1015,6 @@ export default function App(){
     return srt.subtitles.find(sub => currentTime >= sub.start && currentTime < sub.end) || null
   }, [srt, currentTime])
 
-  // Get next subtitle for preview
-  const nextSubtitle = useMemo(() => {
-    if (!srt?.subtitles) return null
-    return srt.subtitles.find(sub => sub.start > currentTime) || null
-  }, [srt, currentTime])
-
-  // Index of current subtitle and a window around it
-  const currentSubtitleIndex = useMemo(() => {
-    if (!srt?.subtitles) return -1
-    const list = srt.subtitles
-    for (let i = 0; i < list.length; i++) {
-      const sub = list[i]
-      if (currentTime >= sub.start && currentTime < sub.end) return i
-      if (currentTime < sub.start) return i - 1
-    }
-    return list.length - 1
-  }, [srt, currentTime])
-
-  const aroundSubtitles = useMemo(() => {
-    if (!srt?.subtitles) return [] as Array<{sub: Subtitle; isCurrent: boolean}>
-    const startIdx = Math.max(0, currentSubtitleIndex - 3)
-    const endIdx = Math.min(srt.subtitles.length, currentSubtitleIndex + 7)
-    return srt.subtitles.slice(startIdx, endIdx).map((sub) => ({ sub, isCurrent: currentSubtitle?.id === sub.id }))
-  }, [srt, currentSubtitleIndex, currentSubtitle])
-
-  const aroundListRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!followSubtitle) return
-    const el = aroundListRef.current
-    if (!el) return
-    const currentEl = el.querySelector('.sub-item.current') as HTMLElement | null
-    if (currentEl) currentEl.scrollIntoView({ block: 'center' })
-  }, [currentSubtitle?.id, followSubtitle])
-
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.playbackRate = playbackRate;
@@ -803,23 +1039,9 @@ export default function App(){
     return defaultTracks
   }, [speakers, defaultTracks])
 
-  // search query for subtitles
-  const [subtitleQuery, setSubtitleQuery] = useState('')
   const allSubtitles = useMemo(() => {
     return srt?.subtitles ?? []
   }, [srt])
-  const visibleSubtitles = useMemo(() => {
-    const q = subtitleQuery.trim().toLowerCase()
-    if (q) return allSubtitles.filter(s => s.text.toLowerCase().includes(q)).slice(0, 250)
-    if (allSubtitles.length <= 80) return allSubtitles
-    const selectedSubtitleIndex = selectedSegment
-      ? allSubtitles.findIndex((sub) => sub.start <= selectedSegment.end && sub.end >= selectedSegment.start)
-      : -1
-    const centerIndex = selectedSubtitleIndex >= 0 ? selectedSubtitleIndex : Math.max(0, currentSubtitleIndex)
-    const startIdx = Math.max(0, centerIndex - 24)
-    const endIdx = Math.min(allSubtitles.length, centerIndex + 36)
-    return allSubtitles.slice(startIdx, endIdx)
-  }, [allSubtitles, currentSubtitleIndex, selectedSegment, subtitleQuery])
   const sortedSegmentRows = useMemo(
     () => segments.slice().sort((a, b) => a.start - b.start).map((segment, index) => ({ segment, index })),
     [segments],
@@ -828,17 +1050,97 @@ export default function App(){
     if (segmentStatusFilter === 'all') return sortedSegmentRows
     return sortedSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === segmentStatusFilter)
   }, [segmentStatusFilter, sortedSegmentRows])
-  const selectedSegmentRowIndex = useMemo(
-    () => filteredSegmentRows.findIndex((row) => row.segment.id === selectedSegId),
-    [filteredSegmentRows, selectedSegId],
+  const dialogueRows = filteredSegmentRows
+  const playbackSegmentRow = useMemo(
+    () => sortedSegmentRows.find(({ segment }) => currentTime >= segment.start && currentTime < segment.end) ?? null,
+    [currentTime, sortedSegmentRows],
   )
-  const visibleSegmentRows = useMemo(() => {
-    if (filteredSegmentRows.length <= 140) return filteredSegmentRows
-    const centerIndex = selectedSegmentRowIndex >= 0 ? selectedSegmentRowIndex : 0
-    const startIdx = Math.max(0, centerIndex - 45)
-    const endIdx = Math.min(filteredSegmentRows.length, centerIndex + 75)
-    return filteredSegmentRows.slice(startIdx, endIdx)
-  }, [filteredSegmentRows, selectedSegmentRowIndex])
+  const activePlaybackSegmentRow = useMemo(() => {
+    if (playbackSegmentRow) return playbackSegmentRow
+    let previousRow: { segment: Segment; index: number } | null = null
+    for (const row of sortedSegmentRows) {
+      if (row.segment.start > currentTime) break
+      previousRow = row
+    }
+    return previousRow
+  }, [currentTime, playbackSegmentRow, sortedSegmentRows])
+  const activePlaybackSegmentId = activePlaybackSegmentRow?.segment.id ?? null
+  const scrollDialogueRowIntoView = useCallback((segmentId: string | null, block: ScrollLogicalPosition = 'center') => {
+    if (!segmentId) return
+    const container = dialogueListRef.current
+    if (!container) return
+    const rowIndex = dialogueRows.findIndex(({ segment }) => segment.id === segmentId)
+    if (rowIndex < 0) return
+    const rowTop = rowIndex * DIALOGUE_ROW_HEIGHT
+    const rowBottom = rowTop + DIALOGUE_ROW_HEIGHT
+    const visibleTop = container.scrollTop
+    const visibleBottom = visibleTop + container.clientHeight
+    let nextTop = rowTop
+    if (block === 'center') {
+      nextTop = rowTop - (container.clientHeight - DIALOGUE_ROW_HEIGHT) / 2
+    } else if (block === 'nearest' && rowTop >= visibleTop && rowBottom <= visibleBottom) {
+      return
+    } else if (block === 'nearest' && rowBottom > visibleBottom) {
+      nextTop = rowBottom - container.clientHeight
+    }
+    const maxTop = Math.max(0, dialogueRows.length * DIALOGUE_ROW_HEIGHT - container.clientHeight)
+    nextTop = Math.max(0, Math.min(maxTop, nextTop))
+    autoDialogueScrollingRef.current = true
+    container.scrollTo({ top: nextTop, behavior: 'auto' })
+    setDialogueScrollTop(nextTop)
+    if (releaseAutoDialogueScrollRef.current !== null) {
+      window.clearTimeout(releaseAutoDialogueScrollRef.current)
+    }
+    releaseAutoDialogueScrollRef.current = window.setTimeout(() => {
+      autoDialogueScrollingRef.current = false
+    }, 160)
+  }, [dialogueRows])
+  useEffect(() => {
+    if (!followPlayback) return
+    scrollDialogueRowIntoView(activePlaybackSegmentId, 'center')
+  }, [activePlaybackSegmentId, followPlayback, scrollDialogueRowIntoView])
+  useEffect(() => {
+    if (!isPlaying || !followPlayback || !activePlaybackSegmentId) return
+    setSelectedSegId((current) => current === activePlaybackSegmentId ? current : activePlaybackSegmentId)
+  }, [activePlaybackSegmentId, followPlayback, isPlaying])
+  useEffect(() => {
+    if (followPlayback) return
+    scrollDialogueRowIntoView(selectedSegId, 'nearest')
+  }, [followPlayback, scrollDialogueRowIntoView, selectedSegId])
+  const onDialogueListScroll = useCallback(() => {
+    setDialogueScrollTop(dialogueListRef.current?.scrollTop ?? 0)
+    if (autoDialogueScrollingRef.current) return
+    if (followPlayback) setFollowPlayback(false)
+  }, [followPlayback])
+  useEffect(() => {
+    const container = dialogueListRef.current
+    if (!container) return
+    const update = () => {
+      setDialogueViewportHeight(container.clientHeight || 480)
+      setDialogueScrollTop(container.scrollTop || 0)
+    }
+    update()
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', update)
+      return () => window.removeEventListener('resize', update)
+    }
+    const observer = new ResizeObserver(update)
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [dialogueRows.length, rightCollapsed])
+  const virtualDialogueRows = useMemo(() => {
+    const total = dialogueRows.length
+    const startIndex = Math.max(0, Math.floor(dialogueScrollTop / DIALOGUE_ROW_HEIGHT) - DIALOGUE_OVERSCAN_ROWS)
+    const endIndex = Math.min(
+      total,
+      Math.ceil((dialogueScrollTop + dialogueViewportHeight) / DIALOGUE_ROW_HEIGHT) + DIALOGUE_OVERSCAN_ROWS,
+    )
+    return {
+      rows: dialogueRows.slice(startIndex, endIndex),
+      topPadding: startIndex * DIALOGUE_ROW_HEIGHT,
+      bottomPadding: Math.max(0, (total - endIndex) * DIALOGUE_ROW_HEIGHT),
+    }
+  }, [dialogueRows, dialogueScrollTop, dialogueViewportHeight])
   const reviewProgress = useMemo(() => {
     const counts: Record<ReviewStatus, number> = {
       pending: 0,
@@ -864,11 +1166,6 @@ export default function App(){
     () => filteredSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending').length,
     [filteredSegmentRows],
   )
-  const visiblePendingCount = useMemo(
-    () => visibleSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending').length,
-    [visibleSegmentRows],
-  )
-
   // right panel auto collapse/expand logic based on data presence
   const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
   const hasRef = useMemo(()=> (!!refRTTM) || refSegments.length>0, [refRTTM, refSegments.length])
@@ -878,6 +1175,7 @@ export default function App(){
     [media?.name, rttm?.name, refRTTM?.name, srt?.name, candidateFile?.name],
   )
   useEffect(() => {
+    if (bootDraftRestoredRef.current) return
     if (!episodeManuallySelectedRef.current && currentEpisodeLabel !== '未识别') {
       setSelectedEpisodeId(currentEpisodeLabel.replace(/^EP/i, ''))
     }
@@ -921,7 +1219,7 @@ export default function App(){
         required: false,
         name: candidateFile?.name,
         detail: candidateFile ? `${candidateFile.entries.length} matches` : '声纹/人脸候选证据，强烈建议加载',
-        state: makeState(candidateFile?.name, true),
+        state: candidateFile ? 'loaded' : 'optional-missing',
         action: () => candidateInputRef.current?.click(),
       },
       {
@@ -939,24 +1237,55 @@ export default function App(){
     () => episodeRequirementRows.filter((row) => row.required && row.state !== 'loaded').length,
     [episodeRequirementRows],
   )
+  const isReadyForAnnotation = missingRequiredCount === 0
+  const requiredLoadedCount = episodeRequirementRows.filter((row) => row.required && row.state === 'loaded').length
+  const requiredTotalCount = episodeRequirementRows.filter((row) => row.required).length
+  const modeLabel = workMode === 'prepare' ? '准备模式' : '标注模式'
   const episodeOptions = useMemo(
     () => Array.from({ length: 30 }, (_, index) => normalizeEpisodeId(index + 1)),
     [],
   )
-  useEffect(()=>{
-    if(!hasRTTM && !hasSRT) setRightCollapsed(true)
-    else setRightCollapsed(false)
-  }, [hasRTTM, hasSRT])
+  useEffect(() => {
+    if (!isReadyForAnnotation) {
+      hasAutoEnteredAnnotationRef.current = false
+      setWorkMode('prepare')
+      setLeftCollapsed(false)
+      setRightCollapsed(!hasRTTM && !hasSRT)
+      return
+    }
+    setRightCollapsed(false)
+    if (!hasAutoEnteredAnnotationRef.current) {
+      hasAutoEnteredAnnotationRef.current = true
+      setWorkMode('annotate')
+      if (!resourcePanelManuallyChangedRef.current) setLeftCollapsed(true)
+    }
+  }, [hasRTTM, hasSRT, isReadyForAnnotation])
+  const toggleResourcePanel = useCallback(() => {
+    resourcePanelManuallyChangedRef.current = true
+    setLeftCollapsed((value) => !value)
+  }, [])
+  const changeWorkMode = useCallback((mode: WorkMode) => {
+    setWorkMode(mode)
+    if (mode === 'prepare') {
+      resourcePanelManuallyChangedRef.current = true
+      setLeftCollapsed(false)
+    } else if (isReadyForAnnotation) {
+      resourcePanelManuallyChangedRef.current = true
+      setLeftCollapsed(true)
+    }
+  }, [isReadyForAnnotation])
 
   // playback controls below video (requirement 2)
   const togglePlay = () => {
     const el = videoRef.current
     if(!el) return
-    if(el.paused){ el.play(); el.playbackRate = playbackRate; setIsPlaying(true) } else { el.pause(); setIsPlaying(false) }
+    if(el.paused){ setFollowPlayback(true); el.play(); el.playbackRate = playbackRate; setIsPlaying(true) } else { el.pause(); setIsPlaying(false) }
   }
   const seek = (t:number) => {
     const el = videoRef.current; if(!el) return
-    el.currentTime = Math.max(0, Math.min(t, duration||el.duration||0))
+    const nextTime = Math.max(0, Math.min(t, duration||el.duration||0))
+    el.currentTime = nextTime
+    setCurrentTime(nextTime)
   }
   const jumpToNextStatus = (status: ReviewStatus = 'pending') => {
     const rows = sortedSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === status)
@@ -966,6 +1295,20 @@ export default function App(){
     setSelectedSegId(target.segment.id)
     seek(target.segment.start)
   }
+  const markSelectedAsChecked = () => {
+    if (!selectedSegId) return
+    updateSelectedSegment({ reviewStatus: 'checked' })
+    const anchor = selectedSegment?.start ?? currentTime
+    const pendingRows = sortedSegmentRows.filter(({ segment }) => (
+      segment.id !== selectedSegId && (segment.reviewStatus || 'pending') === 'pending'
+    ))
+    const afterCurrent = pendingRows.find(({ segment }) => segment.start > anchor + 0.03)
+    const target = afterCurrent || pendingRows[0]
+    if (target) {
+      setSelectedSegId(target.segment.id)
+      seek(target.segment.start)
+    }
+  }
   const assignSelectedSpeaker = (speaker: Speaker) => {
     if (!selectedSegment) return
     updateSelectedSegment({
@@ -974,8 +1317,8 @@ export default function App(){
       reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
     })
   }
-  const markPendingRowsAsChecked = (scope: 'visible' | 'filtered') => {
-    const rows = scope === 'visible' ? visibleSegmentRows : filteredSegmentRows
+  const markFilteredPendingRowsAsChecked = () => {
+    const rows = filteredSegmentRows
     const targetIds = new Set(
       rows
         .filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending')
@@ -1009,70 +1352,88 @@ export default function App(){
     if(defaultLoadedRef.current) return
     defaultLoadedRef.current = true
     try {
+      const restoredDraft = bootDraftRestoredRef.current
+      const pickEpisodeFile = (keys: string[]) => {
+        const matched = keys.find((key) => fileMatchesEpisode(key.split('/').pop() || key, selectedEpisodeId))
+        return matched || (restoredDraft ? undefined : keys[0])
+      }
       const mediaKeys = Object.keys(defaultMediaFiles).sort()
       if(mediaKeys.length > 0){
-        const mp4First = mediaKeys.find(k=>/\.mp4$/i.test(k)) || mediaKeys[0]
-        const url = defaultMediaFiles[mp4First]
-        const name = mp4First.split('/').pop() || 'media'
-        const type: MediaType = /\.(mp4|webm)$/i.test(name) ? 'video' : 'audio'
-        setMedia({ id: 'default-media', name, type, url })
-        const mediaBase = name.replace(/\.[^/.]+$/, '').toLowerCase()
-        const audioFirst = mediaKeys.find((key) => {
-          const fileName = key.split('/').pop() || ''
-          return /\.(wav|mp3|m4a)$/i.test(fileName) && fileName.replace(/\.[^/.]+$/, '').toLowerCase() === mediaBase
-        }) || mediaKeys.find((key) => /\.(wav|mp3|m4a)$/i.test(key)) || mp4First
-        setWaveformSource({
-          url: defaultMediaFiles[audioFirst],
-          name: audioFirst.split('/').pop() || name,
-        })
+        const episodeMediaKeys = mediaKeys.filter((key) => fileMatchesEpisode(key.split('/').pop() || key, selectedEpisodeId))
+        const mediaPool = episodeMediaKeys.length > 0 ? episodeMediaKeys : (restoredDraft ? [] : mediaKeys)
+        const mp4First = mediaPool.find(k=>/\.mp4$/i.test(k)) || mediaPool[0]
+        if (mp4First) {
+          const url = defaultMediaFiles[mp4First]
+          const name = mp4First.split('/').pop() || 'media'
+          const type: MediaType = /\.(mp4|webm)$/i.test(name) ? 'video' : 'audio'
+          setMedia({ id: 'default-media', name, type, url })
+          const mediaBase = name.replace(/\.[^/.]+$/, '').toLowerCase()
+          const audioFirst = mediaKeys.find((key) => {
+            const fileName = key.split('/').pop() || ''
+            return /\.(wav|mp3|m4a)$/i.test(fileName) && fileName.replace(/\.[^/.]+$/, '').toLowerCase() === mediaBase
+          }) || mediaKeys.find((key) => /\.(wav|mp3|m4a)$/i.test(key)) || mp4First
+          setWaveformSource({
+            url: defaultMediaFiles[audioFirst],
+            name: audioFirst.split('/').pop() || name,
+          })
+        } else if (restoredDraft) {
+          setMedia(null)
+          setWaveformSource(null)
+        }
       }
       const rttmKeys = Object.keys(defaultRttmFiles).sort()
-      if(rttmKeys.length > 0){
-        const firstPath = rttmKeys[0]
-        const content = defaultRttmFiles[firstPath]
-        const name = firstPath.split('/').pop() || 'segments.rttm'
-        const parsed = parseRTTM(content)
-        setSegments(parsed.segments)
-        setSpeakers(parsed.speakers)
-        const blob = new Blob([content], {type:'text/plain'})
-        const url = URL.createObjectURL(blob)
-        setRTTM({ id: 'default-rttm', name, url, matched: true })
+      if(rttmKeys.length > 0 && !restoredDraft){
+        const firstPath = pickEpisodeFile(rttmKeys)
+        if (firstPath) {
+          const content = defaultRttmFiles[firstPath]
+          const name = firstPath.split('/').pop() || 'segments.rttm'
+          const parsed = parseRTTM(content)
+          setSegments(parsed.segments)
+          setSpeakers(parsed.speakers)
+          const blob = new Blob([content], {type:'text/plain'})
+          const url = URL.createObjectURL(blob)
+          setRTTM({ id: 'default-rttm', name, url, matched: true })
+        }
       }
       const srtKeys = Object.keys(defaultSrtFiles).sort()
       if(srtKeys.length > 0){
-        const firstPath = srtKeys[0]
-        const content = defaultSrtFiles[firstPath]
-        const name = firstPath.split('/').pop() || 'subtitles.srt'
-        const subtitles = parseSRT(content)
-        const blob = new Blob([content], {type:'text/plain'})
-        const url = URL.createObjectURL(blob)
-        setSRT({ id: 'default-srt', name, url, subtitles })
+        const firstPath = pickEpisodeFile(srtKeys)
+        if (firstPath) {
+          const content = defaultSrtFiles[firstPath]
+          const name = firstPath.split('/').pop() || 'subtitles.srt'
+          const subtitles = parseSRT(content)
+          const blob = new Blob([content], {type:'text/plain'})
+          const url = URL.createObjectURL(blob)
+          setSRT({ id: 'default-srt', name, url, subtitles })
+        }
       }
       const candidateKeys = Object.keys(defaultCandidateFiles).sort()
       if(candidateKeys.length > 0){
-        const preferredPath = candidateKeys.find((key) => /subseg|match/i.test(key)) || candidateKeys[0]
-        const content = defaultCandidateFiles[preferredPath]
-        const name = preferredPath.split('/').pop() || 'subseg_match_results.json'
-        const entries = parseCandidateJSON(content)
-        const blob = new Blob([content], {type:'application/json'})
-        const url = URL.createObjectURL(blob)
-        setCandidateFile({ id: 'default-candidate-json', name, url, entries })
+        const episodeCandidateKeys = candidateKeys.filter((key) => fileMatchesEpisode(key.split('/').pop() || key, selectedEpisodeId))
+        const candidatePool = episodeCandidateKeys.length > 0 ? episodeCandidateKeys : (restoredDraft ? [] : candidateKeys)
+        const preferredPath = candidatePool.find((key) => /subseg|match/i.test(key)) || candidatePool[0]
+        if (preferredPath) {
+          const content = defaultCandidateFiles[preferredPath]
+          const name = preferredPath.split('/').pop() || 'subseg_match_results.json'
+          const entries = parseCandidateJSON(content)
+          const blob = new Blob([content], {type:'application/json'})
+          const url = URL.createObjectURL(blob)
+          setCandidateFile({ id: 'default-candidate-json', name, url, entries })
+        }
       }
     } catch (e) {
       // ignore
     }
-  }, [])
+  }, [selectedEpisodeId])
 
-  // smoother UI updates while playing
+  // Keep playback UI responsive without forcing a full React render every frame.
   useEffect(()=>{
-    let rafId: number | null = null
-    const tick = () => {
+    if (!isPlaying) return
+    const timer = window.setInterval(() => {
       const el = videoRef.current
       if(el){ setCurrentTime(el.currentTime) }
-      rafId = requestAnimationFrame(tick)
-    }
-    if(isPlaying){ rafId = requestAnimationFrame(tick) }
-    return ()=> { if(rafId!==null) cancelAnimationFrame(rafId) }
+    }, 180)
+    return ()=> window.clearInterval(timer)
   }, [isPlaying])
 
   // prev/next segment buttons logic
@@ -1166,48 +1527,299 @@ export default function App(){
   const subtitleTrackHeight = hasSRT ? SUBTITLE_TRACK_HEIGHT : 0
   const timelineMinHeight = 24 + WAVEFORM_HEIGHT + subtitleTrackHeight + Math.max(2, actualTrackCount) * 28 // ruler + wave + subtitles + tracks
 
-  // click timeline seek
+  // click timeline seek / missing-dialogue time picking
   const waveRef = useRef<HTMLDivElement>(null)
   const waveChunkRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
-  const onClickTimeline = (e: React.MouseEvent) => {
-    const el = waveRef.current; if(!el) return
-    const rect = el.getBoundingClientRect()
-    const x = e.clientX - rect.left + el.scrollLeft
-    const t = x / pxPerSec
-    seek(t)
-  }
-
-  // Pointer-based scrubbing (press-and-hold to move playhead)
-  const scrubAtClient = (clientX: number) => {
-    const el = waveRef.current; if(!el) return
-    const rect = el.getBoundingClientRect()
-    const x = clientX - rect.left + el.scrollLeft
-    const t = x / pxPerSec
-    seek(t)
-  }
-  const onTimelinePointerDown = (e: React.PointerEvent) => {
-    isScrubbingRef.current = true
-    try { (e.target as Element).setPointerCapture?.(e.pointerId) } catch {}
-    scrubAtClient(e.clientX)
-    e.preventDefault()
-  }
-  const onTimelinePointerMove = (e: React.PointerEvent) => {
-    if(!isScrubbingRef.current) return
-    scrubAtClient(e.clientX)
-  }
-  const onTimelinePointerUp = (e: React.PointerEvent) => {
-    isScrubbingRef.current = false
-    try { (e.target as Element).releasePointerCapture?.(e.pointerId) } catch {}
-  }
-
-  // Helpers for drag/creation logic
-  const MIN_DUR = 0.01 // 10ms
+  const [timelineViewport, setTimelineViewport] = useState({ scrollLeft: 0, width: 1200 })
+  const syncTimelineViewport = useCallback(() => {
+    const el = waveRef.current
+    if (!el) return
+    const next = { scrollLeft: el.scrollLeft, width: el.clientWidth || 1200 }
+    setTimelineViewport((prev) => (
+      Math.abs(prev.scrollLeft - next.scrollLeft) < 24 && Math.abs(prev.width - next.width) < 24
+        ? prev
+        : next
+    ))
+  }, [])
+  const onTimelineScroll = useCallback(() => {
+    syncTimelineViewport()
+  }, [syncTimelineViewport])
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(syncTimelineViewport)
+    window.addEventListener('resize', syncTimelineViewport)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.removeEventListener('resize', syncTimelineViewport)
+    }
+  }, [leftCollapsed, rightCollapsed, syncTimelineViewport, timelineWidth])
+  const visibleTimelineRange = useMemo(() => {
+    const totalDuration = duration || 60
+    const overscanPx = Math.max(640, timelineViewport.width)
+    return {
+      start: Math.max(0, (timelineViewport.scrollLeft - overscanPx) / pxPerSec),
+      end: Math.min(totalDuration, (timelineViewport.scrollLeft + timelineViewport.width + overscanPx) / pxPerSec),
+    }
+  }, [duration, pxPerSec, timelineViewport.scrollLeft, timelineViewport.width])
+  const visibleMajorTicks = useMemo(() => {
+    const totalDuration = duration || 0
+    if (totalDuration <= 0) return [] as Array<{ time: number; left: number; major: boolean; showLabel: boolean }>
+    const startIndex = Math.max(0, Math.floor(visibleTimelineRange.start / timeDivision))
+    const endIndex = Math.min(Math.ceil(totalDuration / timeDivision), Math.ceil(visibleTimelineRange.end / timeDivision))
+    const maxTicks = 900
+    const step = Math.max(1, Math.ceil((endIndex - startIndex + 1) / maxTicks))
+    const ticks: Array<{ time: number; left: number; major: boolean; showLabel: boolean }> = []
+    for (let i = startIndex; i <= endIndex; i += step) {
+      const time = i * timeDivision
+      const major = i % 5 === 0
+      const isLastLabel = time >= totalDuration - timeDivision * 0.5
+      ticks.push({ time, left: time * pxPerSec, major, showLabel: major && !isLastLabel })
+    }
+    return ticks
+  }, [duration, pxPerSec, timeDivision, visibleTimelineRange.end, visibleTimelineRange.start])
+  const visibleMinorTicks = useMemo(() => {
+    const totalDuration = duration || 0
+    const minorDiv = timeDivision / 5
+    if (totalDuration <= 0 || minorDiv <= 0 || minorDiv * pxPerSec < 8) {
+      return [] as Array<{ time: number; left: number }>
+    }
+    const startIndex = Math.max(0, Math.floor(visibleTimelineRange.start / minorDiv))
+    const endIndex = Math.min(Math.ceil(totalDuration / minorDiv), Math.ceil(visibleTimelineRange.end / minorDiv))
+    const maxTicks = 1200
+    const step = Math.max(1, Math.ceil((endIndex - startIndex + 1) / maxTicks))
+    const ticks: Array<{ time: number; left: number }> = []
+    for (let i = startIndex; i <= endIndex; i += step) {
+      const time = i * minorDiv
+      const isMajorAligned = Math.abs(time % timeDivision) < 1e-6
+      if (!isMajorAligned) ticks.push({ time, left: time * pxPerSec })
+    }
+    return ticks
+  }, [duration, pxPerSec, timeDivision, visibleTimelineRange.end, visibleTimelineRange.start])
   const toTimeFromClientX = (clientX: number) => {
     const el = waveRef.current; if(!el) return 0
     const rect = el.getBoundingClientRect()
     const x = clientX - rect.left + el.scrollLeft
     return Math.max(0, Math.min((duration||0), x / pxPerSec))
   }
+  const isTimelineScrollbarPointer = (clientY: number) => {
+    const el = waveRef.current; if(!el) return false
+    const rect = el.getBoundingClientRect()
+    const horizontalScrollbarHeight = Math.max(0, el.offsetHeight - el.clientHeight)
+    if (horizontalScrollbarHeight === 0) return false
+
+    // Native scrollbar drags should scroll the timeline only, not seek or pick times.
+    return clientY >= rect.bottom - Math.max(12, horizontalScrollbarHeight + 2)
+  }
+  const suppressNextTimelineClick = () => {
+    suppressTimelineClickRef.current = true
+    window.setTimeout(() => {
+      suppressTimelineClickRef.current = false
+    }, 180)
+  }
+  const findSpeakerNameAtTime = (time: number) => {
+    const match = sortedSegmentRows.find(({ segment }) => time >= segment.start && time < segment.end)
+    if (!match) return undefined
+    const speaker = speakers.find((item) => item.id === match.segment.speakerId)
+    return speaker?.name || match.segment.speakerId
+  }
+  const showTimedToast = (message: string, timeout = 3200) => {
+    setToast({ message })
+    window.setTimeout(() => setToast(null), timeout)
+  }
+  const cancelTimeProbeFrame = () => {
+    if (timeProbeFrameRef.current !== null) {
+      window.cancelAnimationFrame(timeProbeFrameRef.current)
+      timeProbeFrameRef.current = null
+    }
+    pendingTimeProbeRef.current = null
+  }
+  const clearTimeProbe = () => {
+    cancelTimeProbeFrame()
+    lastTimeProbeRef.current = null
+    setTimeProbe(null)
+  }
+  const cancelMissingRangePreviewFrame = () => {
+    if (missingRangePreviewFrameRef.current !== null) {
+      window.cancelAnimationFrame(missingRangePreviewFrameRef.current)
+      missingRangePreviewFrameRef.current = null
+    }
+    pendingMissingRangePreviewRef.current = null
+  }
+  const setMissingRangePreviewNow = (preview: { start: number; end: number } | null) => {
+    cancelMissingRangePreviewFrame()
+    setMissingRangePreview(preview)
+  }
+  const scheduleMissingRangePreview = (preview: { start: number; end: number }) => {
+    pendingMissingRangePreviewRef.current = preview
+    if (missingRangePreviewFrameRef.current !== null) return
+    missingRangePreviewFrameRef.current = window.requestAnimationFrame(() => {
+      const pending = pendingMissingRangePreviewRef.current
+      pendingMissingRangePreviewRef.current = null
+      missingRangePreviewFrameRef.current = null
+      if (pending) setMissingRangePreview(pending)
+    })
+  }
+  const sameGhostSegment = (
+    a: {speakerId:string; start:number; end:number} | null,
+    b: {speakerId:string; start:number; end:number} | null,
+  ) => {
+    if (!a || !b) return a === b
+    return a.speakerId === b.speakerId && Math.abs(a.start - b.start) < 0.03 && Math.abs(a.end - b.end) < 0.03
+  }
+  const cancelGhostSegFrame = () => {
+    if (ghostSegFrameRef.current !== null) {
+      window.cancelAnimationFrame(ghostSegFrameRef.current)
+      ghostSegFrameRef.current = null
+    }
+    pendingGhostSegRef.current = null
+  }
+  const setGhostSegNow = (next: {speakerId:string; start:number; end:number} | null) => {
+    cancelGhostSegFrame()
+    lastGhostSegRef.current = next
+    setGhostSeg(next)
+  }
+  const scheduleGhostSeg = (next: {speakerId:string; start:number; end:number}) => {
+    if (sameGhostSegment(lastGhostSegRef.current, next)) return
+    pendingGhostSegRef.current = next
+    if (ghostSegFrameRef.current !== null) return
+    ghostSegFrameRef.current = window.requestAnimationFrame(() => {
+      const pending = pendingGhostSegRef.current
+      pendingGhostSegRef.current = null
+      ghostSegFrameRef.current = null
+      if (!pending || sameGhostSegment(lastGhostSegRef.current, pending)) return
+      lastGhostSegRef.current = pending
+      setGhostSeg(pending)
+    })
+  }
+  const updateTimeProbeFromClient = (clientX: number) => {
+    const time = toTimeFromClientX(clientX)
+    const speakerName = findSpeakerNameAtTime(time)
+    const previous = lastTimeProbeRef.current
+    if (!previous || Math.abs(previous.time - time) >= 0.04 || previous.speakerName !== speakerName) {
+      lastTimeProbeRef.current = { time, speakerName }
+      pendingTimeProbeRef.current = { time, clientX, speakerName }
+      if (timeProbeFrameRef.current === null) {
+        timeProbeFrameRef.current = window.requestAnimationFrame(() => {
+          const pending = pendingTimeProbeRef.current
+          pendingTimeProbeRef.current = null
+          timeProbeFrameRef.current = null
+          if (pending) setTimeProbe(pending)
+        })
+      }
+    }
+    return time
+  }
+  const applyMissingPointAtTime = (mode: Exclude<MissingTimePickMode, 'idle' | 'range'>, time: number) => {
+    const result = applyMissingTimePoint(missingInsertDraft, mode, time)
+    setMissingInsertDraft((prev) => ({ ...prev, ...result.draft }))
+    setMissingPickMode(mode === 'start' ? 'end' : 'idle')
+    showTimedToast(mode === 'start' ? `${result.message}；请继续点击结束秒` : result.message)
+  }
+  const applyMissingRangeAtTimes = (start: number, end: number) => {
+    const result = applyMissingTimeRange(missingInsertDraft, start, end)
+    setMissingInsertDraft((prev) => ({ ...prev, ...result.draft }))
+    setMissingPickMode('idle')
+    setMissingRangePreviewNow(null)
+    missingRangeAnchorRef.current = null
+    showTimedToast(result.message)
+  }
+  const onClickTimeline = (e: React.MouseEvent) => {
+    if (suppressTimelineClickRef.current || isTimelineScrollbarPointer(e.clientY)) {
+      suppressTimelineClickRef.current = false
+      return
+    }
+    if (missingPickMode !== 'idle') return
+    seek(toTimeFromClientX(e.clientX))
+  }
+
+  // Pointer-based scrubbing (press-and-hold to move playhead)
+  const scrubAtClient = (clientX: number) => {
+    seek(toTimeFromClientX(clientX))
+  }
+  const onTimelinePointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return
+    if (isTimelineScrollbarPointer(e.clientY)) {
+      timelineScrollbarDragRef.current = true
+      isScrubbingRef.current = false
+      missingRangeAnchorRef.current = null
+      setMissingRangePreviewNow(null)
+      suppressNextTimelineClick()
+      return
+    }
+    timelineScrollbarDragRef.current = false
+    const time = updateTimeProbeFromClient(e.clientX)
+    if (missingPickMode === 'start' || missingPickMode === 'end') {
+      applyMissingPointAtTime(missingPickMode, time)
+      e.preventDefault()
+      return
+    }
+    if (missingPickMode === 'range') {
+      missingRangeAnchorRef.current = time
+      setMissingRangePreviewNow({ start: time, end: time })
+      try { (e.currentTarget as Element).setPointerCapture?.(e.pointerId) } catch {}
+      e.preventDefault()
+      return
+    }
+    isScrubbingRef.current = true
+    try { (e.currentTarget as Element).setPointerCapture?.(e.pointerId) } catch {}
+    scrubAtClient(e.clientX)
+    e.preventDefault()
+  }
+  const onTimelinePointerMove = (e: React.PointerEvent) => {
+    if (timelineScrollbarDragRef.current) return
+    if (!isScrubbingRef.current && missingRangeAnchorRef.current === null && isTimelineScrollbarPointer(e.clientY)) {
+      return
+    }
+    const time = updateTimeProbeFromClient(e.clientX)
+    if (missingRangeAnchorRef.current !== null) {
+      scheduleMissingRangePreview({ start: missingRangeAnchorRef.current, end: time })
+      return
+    }
+    if(!isScrubbingRef.current) return
+    scrubAtClient(e.clientX)
+  }
+  const onTimelinePointerUp = (e: React.PointerEvent) => {
+    if (timelineScrollbarDragRef.current) {
+      timelineScrollbarDragRef.current = false
+      suppressNextTimelineClick()
+      return
+    }
+    if (missingRangeAnchorRef.current !== null) {
+      const end = updateTimeProbeFromClient(e.clientX)
+      applyMissingRangeAtTimes(missingRangeAnchorRef.current, end)
+      try { (e.currentTarget as Element).releasePointerCapture?.(e.pointerId) } catch {}
+      return
+    }
+    isScrubbingRef.current = false
+    try { (e.currentTarget as Element).releasePointerCapture?.(e.pointerId) } catch {}
+  }
+  const onTimelinePointerLeave = () => {
+    if (!isScrubbingRef.current && missingRangeAnchorRef.current === null && !timelineScrollbarDragRef.current) {
+      clearTimeProbe()
+    }
+  }
+  useEffect(() => {
+    return () => {
+      if (segmentTextCommitTimerRef.current !== null) window.clearTimeout(segmentTextCommitTimerRef.current)
+      if (segmentNotesCommitTimerRef.current !== null) window.clearTimeout(segmentNotesCommitTimerRef.current)
+      if (timeProbeFrameRef.current !== null) window.cancelAnimationFrame(timeProbeFrameRef.current)
+      if (missingRangePreviewFrameRef.current !== null) window.cancelAnimationFrame(missingRangePreviewFrameRef.current)
+      if (ghostSegFrameRef.current !== null) window.cancelAnimationFrame(ghostSegFrameRef.current)
+      segmentTextCommitTimerRef.current = null
+      segmentNotesCommitTimerRef.current = null
+      timeProbeFrameRef.current = null
+      missingRangePreviewFrameRef.current = null
+      ghostSegFrameRef.current = null
+      pendingSegmentTextCommitRef.current = null
+      pendingSegmentNotesCommitRef.current = null
+      pendingTimeProbeRef.current = null
+      pendingMissingRangePreviewRef.current = null
+      pendingGhostSegRef.current = null
+      lastGhostSegRef.current = null
+    }
+  }, [])
+
+  // Helpers for drag/creation logic
+  const MIN_DUR = 0.01 // 10ms
 
   const getSpeakerNeighborBounds = (speakerId: string, segId?: string) => {
     const list = segments.filter(s=>s.speakerId===speakerId).sort((a,b)=>a.start-b.start)
@@ -1239,7 +1851,12 @@ export default function App(){
     })
   }
 
-  const createSegmentAt = (speakerId: string, atTime: number, preset?: Partial<Segment>) => {
+  const createSegmentAt = (
+    speakerId: string,
+    atTime: number,
+    preset?: Partial<Segment>,
+    options?: { preserveRange?: boolean },
+  ) => {
     const id = crypto.randomUUID()
     const baseStart = atTime
     const baseEnd = preset?.end ?? Math.min((duration||atTime+1), atTime + 0.2)
@@ -1256,6 +1873,9 @@ export default function App(){
       ...preset,
     }
     setSegments(prev => {
+      if (options?.preserveRange) {
+        return [...prev, newSeg].sort((a,b)=> a.start-b.start)
+      }
       // Prevent overlap on insert by shrinking into nearest gap
       const list = prev.filter(s=>s.speakerId===speakerId).sort((a,b)=>a.start-b.start)
       let leftBound = 0
@@ -1291,9 +1911,11 @@ export default function App(){
         text: { source: 'manual', value: '' },
         waveform: { suspectedMissing: true },
       },
-    })
+    }, { preserveRange: true })
     setSelectedSegId(id)
     seek(range.start)
+    setToast({ message: '漏句已加入时间轴；请导出 RTTM 或工程 JSON 保存到文件' })
+    window.setTimeout(() => setToast(null), 4200)
   }
 
   const insertMissingDraft = () => {
@@ -1323,12 +1945,15 @@ export default function App(){
         waveform: { suspectedMissing: true },
         fusion: { role: speakerId, strategy: 'manual_missing_dialogue_insert' },
       },
-    })
+    }, { preserveRange: true })
     setMissingInsertDraft({ start: '', end: '', text: '', speakerId })
+    setMissingPickMode('idle')
+    setMissingRangePreviewNow(null)
+    missingRangeAnchorRef.current = null
     setSelectedSegId(id)
     seek(start)
-    setToast({ message: '已插入一条疑似遗漏台词' })
-    window.setTimeout(() => setToast(null), 3200)
+    setToast({ message: '漏句已加入时间轴和台词列表；请导出 RTTM 或工程 JSON 保存到文件' })
+    window.setTimeout(() => setToast(null), 4200)
   }
 
   // Remove segment with optional undo
@@ -1370,9 +1995,10 @@ export default function App(){
     if(Math.abs(targetLeft - viewLeft) < 4) return // tiny changes ignored
 
     el.scrollLeft = targetLeft // immediate jump to avoid interrupting smooth scroll repeatedly
+    syncTimelineViewport()
     autoScrollStateRef.current.lastTs = now
     autoScrollStateRef.current.lastLeft = targetLeft
-  }, [currentTime, pxPerSec])
+  }, [currentTime, pxPerSec, syncTimelineViewport])
 
   // Vertical resize of video area
   const onResizeMouseDown = (e: React.MouseEvent) => {
@@ -1469,29 +2095,71 @@ export default function App(){
   const [waveFailed, setWaveFailed] = useState<boolean>(false)
   const [waveLoading, setWaveLoading] = useState<boolean>(false)
   const [waveMessage, setWaveMessage] = useState<string>('')
-  useEffect(() => {
-    let cancelled = false
-    const sourceUrl = waveformSource?.url || media?.url
-    if (!sourceUrl) {
-      setWavePeaks(null)
-      setWaveFailed(false)
-      setWaveMessage('')
+  const [waveRequestId, setWaveRequestId] = useState(0)
+  const autoWaveformSourceRef = useRef<string | null>(null)
+  const waveformTarget = useMemo(() => ({
+    url: waveformSource?.url || media?.url || '',
+    name: waveformSource?.name || media?.name || '',
+  }), [media?.name, media?.url, waveformSource?.name, waveformSource?.url])
+
+  const requestWaveformGeneration = useCallback(() => {
+    if (!waveformTarget.url) {
+      setToast({ message: '请先加载视频或音频文件，再生成波形。' })
+      window.setTimeout(() => setToast(null), 2800)
       return
     }
+    autoWaveformSourceRef.current = waveformTarget.url
+    setWaveRequestId((value) => value + 1)
+  }, [waveformTarget.url])
+
+  useEffect(() => {
+    setWavePeaks(null)
+    setWaveFailed(false)
+    setWaveLoading(false)
+    setWaveMessage(waveformTarget.url ? '页面稳定后将自动生成波形；也可以点击“生成波形”立即开始。' : '')
+  }, [waveformTarget.url, waveformTarget.name])
+
+  useEffect(() => {
+    const sourceUrl = waveformTarget.url
+    if (!sourceUrl) {
+      autoWaveformSourceRef.current = null
+      return
+    }
+    if (autoWaveformSourceRef.current === sourceUrl) return
+
+    const timer = window.setTimeout(() => {
+      if (autoWaveformSourceRef.current === sourceUrl) return
+      autoWaveformSourceRef.current = sourceUrl
+      setWaveRequestId((value) => value + 1)
+    }, 1500)
+
+    return () => window.clearTimeout(timer)
+  }, [waveformTarget.url])
+
+  useEffect(() => {
+    if (waveRequestId === 0) return
+    let cancelled = false
+    let audioContext: AudioContext | null = null
+    const sourceUrl = waveformTarget.url
+    if (!sourceUrl) return
 
     const loadWaveform = async () => {
       setWavePeaks(null)
       setWaveFailed(false)
       setWaveLoading(true)
-      setWaveMessage('Analyzing waveform...')
+      setWaveMessage('正在生成波形...')
       try {
+        // Yield once so the click/UI update paints before the expensive media decode starts.
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 80))
+        if (cancelled) return
         const response = await fetch(sourceUrl)
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const buffer = await response.arrayBuffer()
         const AudioContextClass = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
         if (!AudioContextClass) throw new Error('Web Audio API is not available')
-        const audioContext = new AudioContextClass()
+        audioContext = new AudioContextClass()
         const audioBuffer = await audioContext.decodeAudioData(buffer.slice(0))
+        if (cancelled) return
         const channel = audioBuffer.getChannelData(0)
         const pointsPerSec = WAVEFORM_POINTS_PER_SEC
         const windowSize = Math.max(1, Math.floor(audioBuffer.sampleRate / pointsPerSec))
@@ -1510,16 +2178,20 @@ export default function App(){
         }
 
         await audioContext.close?.()
+        audioContext = null
         if (cancelled) return
         setWavePeaks(peaks)
         setWaveFailed(false)
-        setWaveMessage(`Waveform: ${waveformSource?.name || media?.name || 'media'}`)
+        setWaveMessage(`波形已生成：${waveformTarget.name || 'media'}`)
       } catch (error) {
         if (cancelled) return
         setWavePeaks(null)
         setWaveFailed(true)
         setWaveMessage(error instanceof Error ? error.message : 'Waveform unavailable')
       } finally {
+        if (audioContext) {
+          try { await audioContext.close?.() } catch {}
+        }
         if (!cancelled) setWaveLoading(false)
       }
     }
@@ -1528,7 +2200,7 @@ export default function App(){
     return () => {
       cancelled = true
     }
-  }, [media?.url, media?.name, waveformSource?.url, waveformSource?.name])
+  }, [waveRequestId, waveformTarget.name, waveformTarget.url])
 
   const waveMissingRanges = useMemo(() => {
     if (!wavePeaks || wavePeaks.length === 0) return [] as Array<{ start: number; end: number }>
@@ -1577,6 +2249,7 @@ export default function App(){
     return Math.max(1, WAVEFORM_MAX_CHUNK_WIDTH / pxPerSec)
   }, [pxPerSec])
   const waveformChunks = useMemo(() => {
+    if (!wavePeaks) return [] as Array<{ index: number; start: number; end: number }>
     const totalDuration = Math.max(duration || 0, wavePeaks ? wavePeaks.length / WAVEFORM_POINTS_PER_SEC : 0, 60)
     const count = Math.max(1, Math.ceil(totalDuration / waveformChunkSeconds))
     return Array.from({ length: count }, (_, index) => {
@@ -1588,6 +2261,7 @@ export default function App(){
 
   // Draw waveform in chunks. A full-episode canvas can exceed browser limits.
   useEffect(()=>{
+    if (!wavePeaks || waveformChunks.length === 0) return
     const dpr = (window.devicePixelRatio||1)
     const H = WAVEFORM_HEIGHT
     const samples = wavePeaks?.length ?? 0
@@ -1679,10 +2353,10 @@ export default function App(){
   }, [refSegments, segments])
 
   return (
-    <div style={{display:'flex', flexDirection:'column', height:'100%'}}>
-      {/* App Bar */}
-      <div className="appbar">
-        <div className="logo">
+    <div className="app-shell notranslate" translate="no" style={{display:'flex', flexDirection:'column', height:'100%'}}>
+      {/* Top status bar */}
+      <div className="appbar annotation-topbar">
+        <div className="logo compact-logo">
           <a
             className="badge github"
             href="https://github.com/DURUII/rttm-visualizer"
@@ -1693,25 +2367,44 @@ export default function App(){
           >
             <Github size={18} />
           </a>
-          <div className="title">{title}</div>
+          <div>
+            <div className="title">{title}</div>
+            <div className="topbar-subtitle">{modeLabel}</div>
+          </div>
         </div>
-        <div className="row">
-          <button className="btn" onClick={exportRTTM}><Download className="file-icon" />导出RTTM</button>
-          <button className="btn" onClick={exportJSON}><Download className="file-icon" />导出工程JSON</button>
-          <button className="btn" onClick={()=> setLeftCollapsed(v=>!v)}>{leftCollapsed? 'Show Left' : 'Hide Left'}</button>
-          <button className="btn" onClick={()=> setRightCollapsed(v=>!v)}>{rightCollapsed? 'Show Right' : 'Hide Right'}</button>
+        <div className="topbar-status">
+          <span className="status-chip selected-chip">{episodeLabelFromId(selectedEpisodeId)}</span>
+          <span className={`status-chip ${media ? 'ok' : 'blocked'}`}>媒体 {media ? '已加载' : '缺失'}</span>
+          <span className={`status-chip ${hasRTTM ? 'ok' : 'blocked'}`}>RTTM {hasRTTM ? '已加载' : '缺失'}</span>
+          <span className={`status-chip ${hasSRT ? 'ok' : 'blocked'}`}>SRT {hasSRT ? '已加载' : '缺失'}</span>
+          <span className="status-chip">进度 {reviewProgress.reviewed} / {reviewProgress.total}</span>
+          <span className="status-chip warn">当前筛选待处理 {filteredPendingCount}</span>
+          <span className={`status-chip ${draftAvailable ? 'ok' : ''}`}>自动草稿 {formatSavedAt(lastDraftSavedAt)}</span>
+        </div>
+        <div className="topbar-actions">
+          <div className="mode-switch">
+            <button className={workMode === 'prepare' ? 'active' : ''} onClick={() => changeWorkMode('prepare')}>准备</button>
+            <button className={workMode === 'annotate' ? 'active' : ''} onClick={() => changeWorkMode('annotate')} disabled={!isReadyForAnnotation}>标注</button>
+          </div>
+          <button className="btn tiny" onClick={exportRTTM}><Download className="file-icon" />导出RTTM</button>
+          <button className="btn tiny primary-action" onClick={exportJSON}><Download className="file-icon" />导出工程JSON</button>
         </div>
       </div>
 
       <div className="layout">
-        {/* Left panel: uploads and DER */}
-        <div className={"panel section" + (leftCollapsed ? ' collapsed' : '')}
+        {/* Left panel: resource loading and checks */}
+        <div className={"panel resource-panel section" + (leftCollapsed ? ' collapsed' : '')}
           onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}}
           onDragLeave={()=>setDragOver(false)}
           onDrop={onDrop}
         >
-          {!leftCollapsed && null}
-
+          {leftCollapsed ? (
+            <button className="resource-rail-button" onClick={toggleResourcePanel} title="展开资源面板">
+              <span>资源</span>
+              <small>{requiredLoadedCount}/{requiredTotalCount}</small>
+            </button>
+          ) : (
+            <>
           <div className="section">
             <div className="card source-status-card episode-wizard">
               <div className="wizard-header">
@@ -1783,125 +2476,19 @@ export default function App(){
                   </div>
                 ))}
               </div>
+              <input ref={mediaInputRef} type="file" style={{display:'none'}} accept=".mp4,.webm,.mp3,.wav,.m4a"
+                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
+              <input ref={rttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
+                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'sys')} />
+              <input ref={refRttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
+                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'ref')} />
+              <input ref={srtInputRef} type="file" style={{display:'none'}} accept=".srt"
+                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
               <input ref={candidateInputRef} type="file" style={{display:'none'}} accept=".json"
-                onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'candidate')} />
-            </div>
-          </div>
-
-          <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'sys') }}>
-            <div className="card">
-              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                <div style={{fontWeight:700}}>Media</div>
-                <button className="btn" onClick={()=> mediaInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
-                <input ref={mediaInputRef} type="file" style={{display:'none'}} accept=".mp4,.webm,.mp3,.wav,.m4a"
-                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
-              </div>
-              {media ? (
-                <div className="file-list-item">
-                  {media.type==='video' ? <FileVideo className="file-icon"/> : <FileAudio className="file-icon"/>}
-                  <div style={{overflow:'hidden'}}>
-                    <div style={{fontSize:14, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>{media.name}</div>
-                    <div className="badge-sm">{duration? formatTime(duration): '--:--'}</div>
-                  </div>
-                </div>
-              ) : <div className="badge-sm">No media selected</div>}
-            </div>
-          </div>
-
-          <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'sys') }}>
-            <div className="card">
-              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                <div style={{fontWeight:700}}>RTTM</div>
-                <button className="btn" onClick={()=> rttmInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
-                <input ref={rttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
-                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'sys')} />
-              </div>
-              {rttm ? (
-                <div className="file-list-item">
-                  <FileText className="file-icon"/>
-                  <div style={{overflow:'hidden'}}>
-                    <div style={{fontSize:14, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>{rttm.name}</div>
-                    <div className="badge-sm">Segments: {segments.length}</div>
-                  </div>
-                </div>
-              ) : <div className="badge-sm">Drop an .rttm file</div>}
-            </div>
-          </div>
-
-          <div className="section" onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{ e.preventDefault(); setDragOver(false); if(e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files), 'ref') }}>
-            <div className="card">
-              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                <div style={{fontWeight:700}}>Ref RTTM</div>
-                <button className="btn" onClick={()=> refRttmInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
-                <input ref={refRttmInputRef} type="file" style={{display:'none'}} accept=".rttm"
-                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files), 'ref')} />
-              </div>
-              {refRTTM ? (
-                <div className="file-list-item">
-                  <FileText className="file-icon"/>
-                  <div style={{overflow:'hidden'}}>
-                    <div style={{fontSize:14, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>{refRTTM.name}</div>
-                    <div className="badge-sm">Segments: {refSegments.length} · Locked</div>
-                  </div>
-                </div>
-              ) : <div className="badge-sm">Optional reference .rttm for DER</div>}
-
-              {/* Inline DER inside Ref RTTM card */}
-              {refRTTM && rttm && metrics && (
-                <div style={{marginTop:12}}>
-                  <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                    <div style={{fontWeight:700}}>DER</div>
-                    <div className="row">
-                      <label className="badge-sm" style={{display:'inline-flex', alignItems:'center', gap:6}}>
-                        <input type="checkbox" checked={showRefTrack} onChange={e=> setShowRefTrack(e.target.checked)} /> Ref
-                      </label>
-                      <label className="badge-sm" style={{display:'inline-flex', alignItems:'center', gap:6}}>
-                        <input type="checkbox" checked={showDER} onChange={e=> setShowDER(e.target.checked)} /> Overlay
-                      </label>
-                    </div>
-                  </div>
-                  <div className="grid two">
-                    <div className="metric" title="Missed Speech: 参考有语音，系统无语音">
-                      <div className="badge-sm" style={{color:'#60a5fa'}}>Missed Speech</div>
-                      <div style={{fontSize:18, fontWeight:700, color:'#60a5fa'}}>{metrics.MS.toFixed(2)}%</div>
-                    </div>
-                    <div className="metric" title="False Alarm: 系统有语音，参考无语音">
-                      <div className="badge-sm" style={{color:'#ef4444'}}>False Alarm</div>
-                      <div style={{fontSize:18, fontWeight:700, color:'#ef4444'}}>{metrics.FA.toFixed(2)}%</div>
-                    </div>
-                    <div className="metric" title="Speaker Error: 双方都为语音但说话人不匹配">
-                      <div className="badge-sm" style={{color:'#f59e0b'}}>Speaker Error Rate</div>
-                      <div style={{fontSize:18, fontWeight:700, color:'#f59e0b'}}>{metrics.SER.toFixed(2)}%</div>
-                    </div>
-                    <div className="metric" title="DER = Missed Speech + False Alarm + Speaker Error Rate">
-                      <div className="badge-sm">DER</div>
-                      <div style={{fontSize:20, fontWeight:800}}>{metrics.DER.toFixed(2)}%</div>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-
-          
-
-          <div className="section">
-            <div className="card">
-              <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                <div style={{fontWeight:700}}>SRT</div>
-                <button className="btn" onClick={()=> srtInputRef.current?.click()}><Upload className="file-icon"/>Upload</button>
-                <input ref={srtInputRef} type="file" style={{display:'none'}} accept=".srt"
-                  onChange={e=> e.target.files && handleFiles(Array.from(e.target.files))} />
-              </div>
-              {srt ? (
-                <div className="file-list-item">
-                  <Subtitles className="file-icon"/>
-                  <div style={{overflow:'hidden'}}>
-                    <div style={{fontSize:14, whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>{srt.name}</div>
-                    <div className="badge-sm">Subtitles: {srt.subtitles.length}</div>
-                  </div>
-                </div>
-              ) : <div className="badge-sm">Drop an .srt file</div>}
+                onChange={(event) => {
+                  if (event.target.files) handleFiles(Array.from(event.target.files), 'candidate')
+                  event.currentTarget.value = ''
+                }} />
             </div>
           </div>
 
@@ -1909,7 +2496,12 @@ export default function App(){
             <div className="card">
               <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
                 <div style={{fontWeight:700}}>Waveform Check</div>
-                <span className="badge-sm">{waveMissingRanges.length} gaps</span>
+                <div className="row">
+                  <span className="badge-sm">{waveMissingRanges.length} gaps</span>
+                  <button className="btn tiny" onClick={requestWaveformGeneration} disabled={waveLoading || !waveformTarget.url}>
+                    {waveLoading ? '生成中' : wavePeaks ? '重新生成' : '生成波形'}
+                  </button>
+                </div>
               </div>
               <div className="badge-sm" style={{marginBottom:8}}>
                 {waveLoading ? 'Analyzing waveform...' : waveMessage || 'Waveform waits for media'}
@@ -1933,6 +2525,8 @@ export default function App(){
               )}
             </div>
           </div>
+            </>
+          )}
         </div>
 
         {/* Center content: video + controls + timeline (resizable video area, scrollable tracks) */}
@@ -1979,23 +2573,26 @@ export default function App(){
 
           {/* Timeline area with dynamic height */}
           <div className="timeline-wrap" style={{flex: '1 1 auto', minHeight: '200px', display:'flex', flexDirection:'column', padding: '0 12px'}}>
-            <div className="timeline" style={{flex: '1 1 auto', minHeight: '200px'}} ref={waveRef} onClick={onClickTimeline}
+            <div className={`timeline${missingPickMode !== 'idle' ? ' picking-time' : ''}`} style={{flex: '1 1 auto', minHeight: '200px'}} ref={waveRef} onClick={onClickTimeline}
+              onScroll={onTimelineScroll}
               onPointerDown={onTimelinePointerDown}
               onPointerMove={onTimelinePointerMove}
               onPointerUp={onTimelinePointerUp}
+              onPointerCancel={onTimelinePointerUp}
+              onPointerLeave={onTimelinePointerLeave}
             >
               {/* RULER */}
               <div className="ruler" style={{width: '100%', minWidth: timelineWidth}}>
-                {Array.from({length: Math.ceil((duration||0)/timeDivision)}).map((_,i)=>{
-                  const time = i * timeDivision
-                  const left = time * pxPerSec
-                  const major = i % 5 === 0
+                {visibleMajorTicks.map((tick)=>{
+                  const time = tick.time
+                  const left = tick.left
+                  const major = tick.major
                   // 避免最后一个标签挤出边界
                   const isLastLabel = time >= (duration||0) - timeDivision * 0.5
                   return (
-                    <div key={`major-${i}`}>
+                    <div key={`major-${time}`}>
                       <div className="tick" style={{left, height: '100%', opacity: 1}}></div>
-                      {major && !isLastLabel && <div className="label" style={{left}}>{formatHMSms(time)}</div>}
+                      {tick.showLabel && <div className="label" style={{left}}>{formatHMSms(time)}</div>}
                     </div>
                   )
                 })}
@@ -2003,40 +2600,51 @@ export default function App(){
                 {duration && duration > 0 && (
                   <div className="label" style={{right: 0, transform: 'translateX(0)'}}>{formatHMSms(duration)}</div>
                 )}
-                {(()=>{
-                  const minorDiv = timeDivision/5
-                  if (minorDiv <= 0) return null
-                  const arr = Array.from({length: Math.ceil((duration||0)/minorDiv)})
-                  return arr.map((_,i)=>{
-                    const time = i * minorDiv
-                    const left = time * pxPerSec
-                    const isMajorAligned = Math.abs(time % timeDivision) < 1e-6
-                    if (isMajorAligned) return null
-                    return (
-                      <div key={`minor-${i}`} className="tick" style={{left, height: '40%', opacity: 0.4}}></div>
-                    )
-                  })
-                })()}
+                {visibleMinorTicks.map((tick) => (
+                  <div key={`minor-${tick.time}`} className="tick" style={{left: tick.left, height: '40%', opacity: 0.4}}></div>
+                ))}
               </div>
               {/* Full-height playhead spanning ruler and tracks */}
               <div className="playhead" style={{left: `${currentTime * pxPerSec}px`}} />
+              {missingRangePreview && (
+                <div
+                  className="missing-range-preview"
+                  style={{
+                    left: `${Math.min(missingRangePreview.start, missingRangePreview.end) * pxPerSec}px`,
+                    width: `${Math.max(2, Math.abs(missingRangePreview.end - missingRangePreview.start) * pxPerSec)}px`,
+                  }}
+                />
+              )}
+              {timeProbe && (
+                <div className="time-probe" style={{left: `${timeProbe.time * pxPerSec}px`}}>
+                  <div className="time-probe-label">
+                    <strong>{formatHMSms(timeProbe.time)}</strong>
+                    <span>{timeProbe.time >= currentTime ? '+' : ''}{(timeProbe.time - currentTime).toFixed(2)}s</span>
+                    {timeProbe.speakerName && <span>{timeProbe.speakerName}</span>}
+                  </div>
+                </div>
+              )}
 
               {/* Waveform */}
               <div className="wave" style={{width: '100%', minWidth: timelineWidth}}>
-                {waveformChunks.map((chunk) => (
-                  <canvas
-                    key={chunk.index}
-                    className="wave-chunk"
-                    ref={(node) => {
-                      if (node) waveChunkRefs.current.set(chunk.index, node)
-                      else waveChunkRefs.current.delete(chunk.index)
-                    }}
-                    style={{
-                      left: chunk.start * pxPerSec,
-                      width: Math.max(1, (chunk.end - chunk.start) * pxPerSec),
-                    }}
-                  />
-                ))}
+                {wavePeaks ? (
+                  waveformChunks.map((chunk) => (
+                    <canvas
+                      key={chunk.index}
+                      className="wave-chunk"
+                      ref={(node) => {
+                        if (node) waveChunkRefs.current.set(chunk.index, node)
+                        else waveChunkRefs.current.delete(chunk.index)
+                      }}
+                      style={{
+                        left: chunk.start * pxPerSec,
+                        width: Math.max(1, (chunk.end - chunk.start) * pxPerSec),
+                      }}
+                    />
+                  ))
+                ) : (
+                  <div className="wave-placeholder" style={{width: timelineWidth}} />
+                )}
                 <div className={`wave-status-chip ${waveFailed ? 'failed' : wavePeaks ? 'ready' : ''}`}>
                   {waveLoading ? '正在生成波形...' : waveFailed ? `波形不可用：${waveMessage}` : wavePeaks ? (waveMessage || '波形已加载') : '等待音频生成波形'}
                 </div>
@@ -2111,7 +2719,7 @@ export default function App(){
                 >
                   {allTracks.map(spk => {
                     const hidden = speakers.length > 0 ? !spk.visible : false
-                    const trackSegments = speakers.length > 0 ? segments.filter(s => s.speakerId === spk.id) : []
+                    const trackSegments = speakers.length > 0 ? (segmentsBySpeaker.get(spk.id) ?? []) : []
                     const isSelectedTrack = selectedSegment?.speakerId === spk.id
                     return (
                       <div
@@ -2140,15 +2748,16 @@ export default function App(){
                           const dur = 0.2
                           const start = Math.max(0, Math.min((duration || 0) - dur, t - dur / 2))
                           const end = Math.min(duration || start + dur, start + dur)
-                          setGhostSeg({ speakerId: spk.id, start, end })
+                          scheduleGhostSeg({ speakerId: spk.id, start, end })
                         }}
-                        onMouseLeave={() => setGhostSeg(null)}
+                        onMouseLeave={() => setGhostSegNow(null)}
                         onClick={(e) => {
                           if ((e.target as HTMLElement).closest('.seg')) return
                           if (speakers.length === 0) return
-                          let t = toTimeFromClientX(e.clientX)
-                          if (ghostSeg && ghostSeg.speakerId === spk.id) { t = ghostSeg.start }
-                          const newId = createSegmentAt(spk.id, t)
+                          const t = toTimeFromClientX(e.clientX)
+                          const dur = 0.2
+                          const start = Math.max(0, Math.min((duration || 0) - dur, t - dur / 2))
+                          const newId = createSegmentAt(spk.id, start)
                           setSelectedSegId(newId)
                         }}
                       >
@@ -2173,11 +2782,12 @@ export default function App(){
                             const left = seg.start * pxPerSec
                             const w = (seg.end - seg.start) * pxPerSec
                             const isActive = currentTime >= seg.start && currentTime < seg.end
+                            const status = seg.reviewStatus || 'pending'
                             return (
                               <div
                                 key={seg.id}
-                                className={`seg${isActive ? ' active' : ''}${selectedSegId === seg.id ? ' selected' : ''}`}
-                                style={{ left, width: w, background: spk.color }}
+                                className={`seg status-${status}${isActive ? ' active' : ''}${selectedSegId === seg.id ? ' selected' : ''}`}
+                                style={{ left, width: Math.max(status === 'inserted' ? 10 : 2, w), background: spk.color }}
                                 onMouseEnter={(e) => {
                                   setTooltip({
                                     x: e.clientX,
@@ -2363,27 +2973,27 @@ export default function App(){
           </div>
         </div>
 
-        {/* Right panel: fixed inspector + scrollable context */}
+        {/* Right panel: current segment review + full dialogue list */}
         <div className={"panel right section" + (rightCollapsed ? ' collapsed' : '')}>
           {!rightCollapsed && (
             <div className="right-workbench">
-              <div className="card fade-in inspector-card">
+              <div className="card fade-in inspector-card current-segment-card">
                 <div className="row inspector-title-row">
                   <div>
-                    <div style={{fontWeight:800}}>校对当前片段</div>
-                    <div className="badge-sm">文本正确且说话人正确时，只点“通过”即可</div>
+                    <div style={{fontWeight:800}}>当前片段校对</div>
+                    <div className="badge-sm">文本和说话人都正确时，只点“通过检查”</div>
                   </div>
-                  <div className="row" style={{gap:6, flexWrap:'wrap', justifyContent:'flex-end'}}>
+                  <div className="review-primary-actions">
                     <button
                       className="btn tiny"
                       disabled={reviewProgress.counts.pending === 0}
                       onClick={() => jumpToNextStatus('pending')}
                     >
-                      下一条 pending
+                      下一条待处理
                     </button>
                     {selectedSegment && (
                       <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
-                        通过 checked
+                        通过检查
                       </button>
                     )}
                   </div>
@@ -2399,10 +3009,22 @@ export default function App(){
                         {selectedSegment.reviewStatus || 'pending'}
                       </span>
                     </div>
-                    {speakers.length > 0 && (
-                      <div className="quick-speaker-panel">
+                    <div className={`quick-speaker-panel${quickSpeakerOpen ? ' open' : ''}`}>
+                        <button
+                          className="quick-panel-toggle"
+                          type="button"
+                          onClick={() => setQuickSpeakerOpen((open) => !open)}
+                        >
+                          <span>一键更改说话人</span>
+                          <span>{quickSpeakerOpen ? '收起' : '展开'}</span>
+                        </button>
                         <div className="quick-panel-title">一键改说话人</div>
+                        {quickSpeakerOpen && (
+                          <>
                         <div className="quick-speaker-grid">
+                          {speakers.length === 0 && (
+                            <div className="badge-sm">暂无说话人，可在下方新增。</div>
+                          )}
                           {speakers.map((speaker) => (
                             <button
                               key={speaker.id}
@@ -2415,8 +3037,30 @@ export default function App(){
                             </button>
                           ))}
                         </div>
+                        <div className="speaker-add-inline">
+                          <input
+                            value={newSpeakerName}
+                            onChange={(event) => setNewSpeakerName(event.target.value)}
+                            placeholder="新增说话人，例如 杨冬"
+                          />
+                          <button className="btn tiny" onClick={() => addSpeaker()}><Plus size={14}/>添加</button>
+                          <button
+                            className="btn tiny"
+                            onClick={() => {
+                              const speaker = addSpeaker(undefined, 'manual')
+                              updateSelectedSegment({
+                                speakerId: speaker.id,
+                                reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+                                evidence: { fusion: { role: speaker.name, strategy: 'manual_new_speaker' } },
+                              })
+                            }}
+                          >
+                            添加并用于当前
+                          </button>
+                        </div>
+                          </>
+                        )}
                       </div>
-                    )}
                     <div className="editor-grid">
                       <label className="field">
                         <span>说话人</span>
@@ -2474,138 +3118,179 @@ export default function App(){
                         <span>台词文本（只有文本错/漏时才需要手动输入）</span>
                         <textarea
                           rows={3}
-                          value={selectedSegment.text || ''}
-                          onChange={(event) => updateSelectedSegment({
-                            text: event.target.value,
-                            evidence: { text: { source: 'manual', value: event.target.value } },
-                            reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
-                          })}
+                          value={segmentTextDraft}
+                          onChange={(event) => scheduleSegmentTextCommit(event.target.value)}
+                          onBlur={flushPendingSegmentText}
                           placeholder="输入或修正这一句台词"
                         />
                       </label>
-                      <label className="field wide">
+                    </div>
+                    <details className="more-actions">
+                      <summary>更多操作：候选证据 / 漏句插入 / 备注</summary>
+                      <div className="candidate-panel">
+                        <div className="candidate-header">
+                          <span>候选匹配 JSON</span>
+                          <span className="badge-sm">{candidateFile?.name || '未加载 subseg_match_results.json'}</span>
+                        </div>
+                        {!candidateFile ? (
+                          <div className="badge-sm">加载候选 JSON 后，这里会显示 top_5_speakers / top_5_faces。</div>
+                        ) : !selectedCandidate ? (
+                          <div className="badge-sm">当前片段附近没有匹配到候选结果。</div>
+                        ) : (
+                          <>
+                            <div className="candidate-line">
+                              <span>{selectedCandidate.segmentKey}</span>
+                              <span>{selectedCandidate.start !== undefined ? formatHMSms(selectedCandidate.start) : '--'} - {selectedCandidate.end !== undefined ? formatHMSms(selectedCandidate.end) : '--'}</span>
+                            </div>
+                            {selectedCandidate.subtitleText && (
+                              <div className="candidate-text">{selectedCandidate.subtitleText}</div>
+                            )}
+                            <div className="candidate-pills">
+                              {selectedCandidate.top5Speakers.slice(0, 5).map((candidate, index) => {
+                                const role = candidate.role || candidate.speaker || `候选${index + 1}`
+                                return (
+                                  <button
+                                    key={`${role}-${index}`}
+                                    className="candidate-pill"
+                                    onClick={() => {
+                                      const existing = speakers.find((speaker) => speaker.id === role || speaker.name === role)
+                                      const speaker = existing || addSpeaker(role, 'candidate')
+                                      updateSelectedSegment({
+                                        speakerId: speaker.id,
+                                        reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+                                        evidence: {
+                                          fusion: {
+                                            role: speaker.name,
+                                            strategy: 'candidate_top5_speaker',
+                                            confidence: candidate.score,
+                                          },
+                                        },
+                                      })
+                                    }}
+                                    title="点击后应用为当前片段说话人"
+                                  >
+                                    {role}{candidate.score !== undefined ? ` ${candidate.score.toFixed(3)}` : ''}
+                                  </button>
+                                )
+                              })}
+                              {selectedCandidate.top5Speakers.length === 0 && <span className="badge-sm">top_5_speakers 为空</span>}
+                            </div>
+                            <div className="badge-sm">top_5_faces: {selectedCandidate.top5Faces.length || '空'}</div>
+                          </>
+                        )}
+                      </div>
+                      <div className="missing-insert-card">
+                        <div className="quick-panel-title">漏句插入向导</div>
+                        <div className="missing-pick-toolbar">
+                          <button
+                            className={`btn tiny${missingPickMode === 'start' ? ' active' : ''}`}
+                            onClick={() => setMissingPickMode((mode) => mode === 'start' ? 'idle' : 'start')}
+                          >
+                            取开始点
+                          </button>
+                          <button
+                            className={`btn tiny${missingPickMode === 'end' ? ' active' : ''}`}
+                            onClick={() => setMissingPickMode((mode) => mode === 'end' ? 'idle' : 'end')}
+                          >
+                            取结束点
+                          </button>
+                          <button
+                            className={`btn tiny${missingPickMode === 'range' ? ' active' : ''}`}
+                            onClick={() => setMissingPickMode((mode) => mode === 'range' ? 'idle' : 'range')}
+                          >
+                            框选漏句
+                          </button>
+                          {missingPickMode !== 'idle' && (
+                            <button
+                              className="btn tiny"
+                              onClick={() => {
+                                setMissingPickMode('idle')
+                                setMissingRangePreviewNow(null)
+                                missingRangeAnchorRef.current = null
+                              }}
+                            >
+                              取消取点
+                            </button>
+                          )}
+                        </div>
+                        <div className="missing-pick-hint">
+                          {missingPickMode === 'start' && '请点击左侧波形/时间轴，自动填入漏句开始秒。'}
+                          {missingPickMode === 'end' && '请点击左侧波形/时间轴，自动填入漏句结束秒。'}
+                          {missingPickMode === 'range' && '请在左侧波形/时间轴拖拽一段范围，自动填入开始秒和结束秒。'}
+                          {missingPickMode === 'idle' && '需要补漏句时，可先用“取开始点 / 取结束点 / 框选漏句”减少手动输入。'}
+                        </div>
+                        <div className="missing-insert-grid">
+                          <label className="field">
+                            <span>开始秒</span>
+                            <input
+                              type="number"
+                              min={0}
+                              step={0.01}
+                              value={missingInsertDraft.start}
+                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, start: event.target.value }))}
+                              placeholder="8.47"
+                            />
+                          </label>
+                          <label className="field">
+                            <span>结束秒</span>
+                            <input
+                              type="number"
+                              min={0}
+                              step={0.01}
+                              value={missingInsertDraft.end}
+                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, end: event.target.value }))}
+                              placeholder="8.57"
+                            />
+                          </label>
+                          <label className="field">
+                            <span>说话人</span>
+                            <select
+                              value={missingInsertDraft.speakerId || selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'}
+                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, speakerId: event.target.value }))}
+                            >
+                              {speakers.length === 0 && <option value="UNKNOWN">UNKNOWN</option>}
+                              {speakers.map((speaker) => (
+                                <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="field">
+                            <span>台词</span>
+                            <input
+                              value={missingInsertDraft.text}
+                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, text: event.target.value }))}
+                              placeholder="可先留空，稍后补"
+                            />
+                          </label>
+                        </div>
+                        <div className="row" style={{justifyContent:'space-between', gap:8}}>
+                          <span className="badge-sm">插入后先进入当前工程状态；需导出 RTTM / 工程 JSON 才会保存到文件</span>
+                          <button className="btn tiny pass-btn" onClick={insertMissingDraft}>插入漏句</button>
+                        </div>
+                      </div>
+                      <label className="field">
                         <span>备注</span>
                         <textarea
                           rows={2}
-                          value={selectedSegment.notes || ''}
-                          onChange={(event) => updateSelectedSegment({ notes: event.target.value })}
+                          value={segmentNotesDraft}
+                          onChange={(event) => scheduleSegmentNotesCommit(event.target.value)}
+                          onBlur={flushPendingSegmentNotes}
                           placeholder="记录证据、疑问或修改原因"
                         />
                       </label>
-                      <div className="row wide inspector-actions">
-                        <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>通过</button>
-                        <button className="btn tiny" onClick={() => updateSelectedSegment({ reviewStatus: 'corrected' })}>标记 corrected</button>
-                        <button className="btn tiny" onClick={() => seek(selectedSegment.start)}>跳转播放</button>
-                      </div>
-                    </div>
-                    <div className="candidate-panel">
-                      <div className="candidate-header">
-                        <span>候选匹配 JSON</span>
-                        <span className="badge-sm">{candidateFile?.name || '未加载 subseg_match_results.json'}</span>
-                      </div>
-                      {!candidateFile ? (
-                        <div className="badge-sm">加载候选 JSON 后，这里会显示 top_5_speakers / top_5_faces。</div>
-                      ) : !selectedCandidate ? (
-                        <div className="badge-sm">当前片段附近没有匹配到候选结果。</div>
-                      ) : (
-                        <>
-                          <div className="candidate-line">
-                            <span>{selectedCandidate.segmentKey}</span>
-                            <span>{selectedCandidate.start !== undefined ? formatHMSms(selectedCandidate.start) : '--'} - {selectedCandidate.end !== undefined ? formatHMSms(selectedCandidate.end) : '--'}</span>
-                          </div>
-                          {selectedCandidate.subtitleText && (
-                            <div className="candidate-text">{selectedCandidate.subtitleText}</div>
-                          )}
-                          <div className="candidate-pills">
-                            {selectedCandidate.top5Speakers.slice(0, 5).map((candidate, index) => {
-                              const role = candidate.role || candidate.speaker || `候选${index + 1}`
-                              return (
-                                <button
-                                  key={`${role}-${index}`}
-                                  className="candidate-pill"
-                                  onClick={() => {
-                                    const existing = speakers.find((speaker) => speaker.id === role || speaker.name === role)
-                                    const speaker = existing || addSpeaker(role, 'candidate')
-                                    updateSelectedSegment({
-                                      speakerId: speaker.id,
-                                      reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
-                                      evidence: {
-                                        fusion: {
-                                          role: speaker.name,
-                                          strategy: 'candidate_top5_speaker',
-                                          confidence: candidate.score,
-                                        },
-                                      },
-                                    })
-                                  }}
-                                  title="点击后应用为当前片段说话人"
-                                >
-                                  {role}{candidate.score !== undefined ? ` ${candidate.score.toFixed(3)}` : ''}
-                                </button>
-                              )
-                            })}
-                            {selectedCandidate.top5Speakers.length === 0 && <span className="badge-sm">top_5_speakers 为空</span>}
-                          </div>
-                          <div className="badge-sm">top_5_faces: {selectedCandidate.top5Faces.length || '空'}</div>
-                        </>
-                      )}
-                    </div>
+                    </details>
                   </>
                 )}
               </div>
 
               <div className="right-scroll">
-                <div className="card fade-in">
-                  <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                    <div style={{fontWeight:700}}>说话人</div>
-                    <span className="badge-sm">{speakers.length || 0} speakers</span>
-                  </div>
-                  <div className="speaker-add-form">
-                    <input
-                      value={newSpeakerName}
-                      onChange={(event) => setNewSpeakerName(event.target.value)}
-                      placeholder="新说话人名，例如 杨冬"
-                    />
-                    <button className="btn tiny" onClick={() => addSpeaker()}><Plus size={14}/>添加</button>
-                    <button
-                      className="btn tiny"
-                      disabled={!selectedSegment}
-                      onClick={() => {
-                        const speaker = addSpeaker(undefined, 'manual')
-                        updateSelectedSegment({
-                          speakerId: speaker.id,
-                          reviewStatus: selectedSegment?.reviewStatus === 'pending' ? 'corrected' : selectedSegment?.reviewStatus,
-                          evidence: { fusion: { role: speaker.name, strategy: 'manual_new_speaker' } },
-                        })
-                      }}
-                    >
-                      添加并用于当前
-                    </button>
-                  </div>
-                  <div className="grid" >
-                    {speakers.length===0 && <div className="badge-sm">尚无说话人。可手动添加，或先加载 RTTM。</div>}
-                    {speakers.map(spk=> (
-                      <div key={spk.id} className={'legend-item ' + (spk.visible? '' : 'hidden')}>
-                        <input type="color" value={spk.color} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, color: e.target.value}: s))} style={{width:24, height:24, border:'none', background:'transparent', padding:0}}/>
-                        <input value={spk.name} onChange={e=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, name: e.target.value}: s))}
-                          style={{flex:1, minWidth:0, background:'#0f141b', border:'1px solid var(--border)', color:'var(--text)', borderRadius:6, padding:'6px 8px'}} />
-                        <button className="btn icon" title={spk.visible? '隐藏' : '显示'} onClick={()=> setSpeakers(speakers.map(s=> s.id===spk.id? {...s, visible: !s.visible}: s))}>
-                          {spk.visible ? <Eye size={14}/> : <EyeOff size={14}/>}
-                        </button>
-                        <button className="btn icon" title="删除" onClick={()=>{
-                          setSpeakers(prev => prev.filter(s=> s.id!==spk.id))
-                          setSegments(prev => prev.filter(seg=> seg.speakerId!==spk.id))
-                        }}><Trash2 size={14}/></button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
                 {segments.length > 0 && (
-                  <div className="card fade-in segment-card">
+                  <div className="card fade-in segment-card dialogue-list-card">
                     <div className="row" style={{justifyContent:'space-between', marginBottom:8}}>
-                      <div style={{fontWeight:700}}>片段表</div>
-                      <span className="badge-sm">显示 {visibleSegmentRows.length} / {filteredSegmentRows.length}</span>
+                      <div>
+                        <div style={{fontWeight:700}}>完整台词列表</div>
+                        <div className="badge-sm">显示 {dialogueRows.length} / {sortedSegmentRows.length}，点击任意行跳转</div>
+                      </div>
                     </div>
                     <div className="segment-toolbar">
                       <select
@@ -2629,138 +3314,51 @@ export default function App(){
                       </button>
                       <button
                         className="btn tiny"
-                        disabled={visiblePendingCount === 0}
-                        onClick={() => markPendingRowsAsChecked('visible')}
-                      >
-                        本页通过 {visiblePendingCount}
-                      </button>
-                      <button
-                        className="btn tiny"
                         disabled={filteredPendingCount === 0}
-                        onClick={() => markPendingRowsAsChecked('filtered')}
+                        onClick={markFilteredPendingRowsAsChecked}
                       >
                         当前筛选通过 {filteredPendingCount}
                       </button>
                     </div>
-                    <div className="missing-insert-card">
-                      <div className="quick-panel-title">漏句插入向导</div>
-                      <div className="missing-insert-grid">
-                        <label className="field">
-                          <span>开始秒</span>
-                          <input
-                            type="number"
-                            min={0}
-                            step={0.01}
-                            value={missingInsertDraft.start}
-                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, start: event.target.value }))}
-                            placeholder="8.47"
-                          />
-                        </label>
-                        <label className="field">
-                          <span>结束秒</span>
-                          <input
-                            type="number"
-                            min={0}
-                            step={0.01}
-                            value={missingInsertDraft.end}
-                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, end: event.target.value }))}
-                            placeholder="8.57"
-                          />
-                        </label>
-                        <label className="field">
-                          <span>说话人</span>
-                          <select
-                            value={missingInsertDraft.speakerId || selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'}
-                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, speakerId: event.target.value }))}
-                          >
-                            {speakers.length === 0 && <option value="UNKNOWN">UNKNOWN</option>}
-                            {speakers.map((speaker) => (
-                              <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="field">
-                          <span>台词</span>
-                          <input
-                            value={missingInsertDraft.text}
-                            onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, text: event.target.value }))}
-                            placeholder="可先留空，稍后补"
-                          />
-                        </label>
-                      </div>
-                      <div className="row" style={{justifyContent:'space-between', gap:8}}>
-                        <span className="badge-sm">用于字幕/RTTM 遗漏：插入后状态为 inserted</span>
-                        <button className="btn tiny pass-btn" onClick={insertMissingDraft}>插入漏句</button>
-                      </div>
-                    </div>
-                    <div className="segment-table">
-                      {visibleSegmentRows.map(({ segment, index }) => {
+                    <div className="segment-table dialogue-table" ref={dialogueListRef} onScroll={onDialogueListScroll}>
+                      {virtualDialogueRows.topPadding > 0 && (
+                        <div className="dialogue-spacer" style={{height: virtualDialogueRows.topPadding}} />
+                      )}
+                      {virtualDialogueRows.rows.map(({ segment, index }) => {
                         const speaker = speakers.find((item) => item.id === segment.speakerId)
+                        const status = segment.reviewStatus || 'pending'
+                        const isPlayback = activePlaybackSegmentId === segment.id
+                        const isSelected = selectedSegId === segment.id && (!isPlaying || !activePlaybackSegmentId)
+                        const rowSubtitle = segment.text?.trim() ? null : findBestSubtitleForSegment(segment, allSubtitles)
+                        const rowTextRaw = segment.text?.trim() || rowSubtitle?.text || '-'
+                        const rowText = stripSpeakerPrefix(rowTextRaw, speakerTextLabels)
                         return (
                           <button
                             key={segment.id}
-                            className={`segment-row${segment.id === selectedSegId ? ' current' : ''}`}
+                            className={`segment-row dialogue-row status-${status}${isPlayback ? ' playing' : ''}${isSelected ? ' current' : ''}`}
+                            title={rowText}
                             onClick={() => {
+                              setFollowPlayback(true)
                               setSelectedSegId(segment.id)
                               seek(segment.start)
                             }}
                           >
                             <span>{index + 1}</span>
                             <span>{formatHMSms(segment.start)}</span>
-                            <span>{speaker?.name || segment.speakerId}</span>
-                            <span>{segment.reviewStatus || 'pending'}</span>
-                            <span>{segment.text || '-'}</span>
+                            <span>{formatHMSms(segment.end)}</span>
+                            <span className="dialogue-speaker-cell">
+                              <strong>{speaker?.name || segment.speakerId}</strong>
+                              <small>ID: {segment.speakerId}</small>
+                            </span>
+                            <span>{status}</span>
+                            <span className="dialogue-text">{rowText}</span>
                           </button>
                         )
                       })}
-                    </div>
-                  </div>
-                )}
-
-                {hasSRT && (
-                  <div className="card fade-in subtitles-card">
-                    <div className="row subtitles-title-row">
-                      <div style={{fontWeight:700}}>字幕上下文</div>
-                      {srt && (
-                        <label className="follow-toggle">
-                          <input type="checkbox" checked={followSubtitle} onChange={(event) => setFollowSubtitle(event.target.checked)} />
-                          跟随播放
-                        </label>
+                      {virtualDialogueRows.bottomPadding > 0 && (
+                        <div className="dialogue-spacer" style={{height: virtualDialogueRows.bottomPadding}} />
                       )}
                     </div>
-                    {srt && (
-                      <input
-                        className="subtitle-search"
-                        value={subtitleQuery}
-                        onChange={e=>setSubtitleQuery(e.target.value)}
-                        placeholder="搜索字幕..."
-                      />
-                    )}
-                    {!srt ? (
-                      <div className="badge-sm">未加载 .srt 文件</div>
-                    ) : (
-                      <>
-                        <div className="badge-sm" style={{marginBottom:8}}>
-                          显示 {visibleSubtitles.length} / {srt.subtitles.length}，搜索时最多显示前 250 条
-                        </div>
-                        <div ref={aroundListRef} className="subtitle-list">
-                          {visibleSubtitles.map((sub) => {
-                            const isCurrent = currentSubtitle?.id === sub.id
-                            return (
-                              <div key={sub.id} className={`sub-item${isCurrent ? ' current' : ''}`} onClick={()=>seek(sub.start)} title={`${formatTime(sub.start)} - ${formatTime(sub.end)}`}>
-                                <div className="sub-time">
-                                  {formatTime(sub.start)} - {formatTime(sub.end)}
-                                </div>
-                                <div className="sub-text">{sub.text}</div>
-                              </div>
-                            )
-                          })}
-                          {visibleSubtitles.length === 0 && (
-                            <div className="empty-list">没有匹配字幕</div>
-                          )}
-                        </div>
-                      </>
-                    )}
                   </div>
                 )}
               </div>
@@ -2791,5 +3389,13 @@ export default function App(){
         </div>
       )}
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <AppContent />
+    </AppErrorBoundary>
   )
 }
