@@ -1098,6 +1098,21 @@ function AppContent(){
     window.setTimeout(() => setToast(null), mode === 'auto' ? 4800 : 3500)
   }, [restoreAnnotationSnapshot])
 
+  const restoreCurrentEpisodeDraft = useCallback(() => {
+    try {
+      const payload = parseDraftPayload(window.localStorage.getItem(draftStorageKey))
+      if (!payload) {
+        setToast({ message: '没有找到本集可恢复的工程草稿' })
+        window.setTimeout(() => setToast(null), 3000)
+        return
+      }
+      applyDraftPayload(payload, 'manual')
+    } catch (error) {
+      setToast({ message: `恢复草稿失败：${error instanceof Error ? error.message : '未知错误'}` })
+      window.setTimeout(() => setToast(null), 4200)
+    }
+  }, [applyDraftPayload, draftStorageKey])
+
   useEffect(() => {
     if (bootDraftCheckedRef.current) return
     bootDraftCheckedRef.current = true
@@ -1123,12 +1138,13 @@ function AppContent(){
   const refRttmInputRef = useRef<HTMLInputElement>(null)
   const srtInputRef = useRef<HTMLInputElement>(null)
   const candidateInputRef = useRef<HTMLInputElement>(null)
+  const projectInputRef = useRef<HTMLInputElement>(null)
   const onDrop = useCallback((e: React.DragEvent)=>{
     e.preventDefault(); setDragOver(false)
     const files = Array.from(e.dataTransfer.files)
     handleFiles(files)
   },[])
-  function handleFiles(files: File[], target?: 'sys'|'ref'|'candidate'){
+  function handleFiles(files: File[], target?: 'sys'|'ref'|'candidate'|'project'){
     for(const f of files){
       const lowerName = f.name.toLowerCase()
       if(lowerName.endsWith('.json')){
@@ -1138,10 +1154,12 @@ function AppContent(){
           try {
             const raw = String(reader.result)
             let projectSnapshot: DraftPayload | null = null
-            try {
-              projectSnapshot = parseReviewProjectSnapshot(raw)
-            } catch {
-              projectSnapshot = null
+            if (target !== 'candidate') {
+              try {
+                projectSnapshot = parseReviewProjectSnapshot(raw)
+              } catch {
+                projectSnapshot = null
+              }
             }
             if (projectSnapshot) {
               URL.revokeObjectURL(url)
@@ -1149,13 +1167,22 @@ function AppContent(){
               setSelectedEpisodeId(projectSnapshot.selectedEpisodeId)
               restoreAnnotationSnapshot(projectSnapshot)
               setSelectedSegId(projectSnapshot.selectedSegId)
+              setLastDraftSavedAt(projectSnapshot.savedAt)
+              setDraftAvailable(true)
+              if (typeof projectSnapshot.lastPlaybackTime === 'number' && Number.isFinite(projectSnapshot.lastPlaybackTime)) {
+                setCurrentTime(projectSnapshot.lastPlaybackTime)
+                if (videoRef.current) videoRef.current.currentTime = projectSnapshot.lastPlaybackTime
+              }
               if (projectSnapshot.sourceFiles.rttm) {
                 setRTTM({ id: 'project-rttm', name: projectSnapshot.sourceFiles.rttm, url: '', matched: true })
               }
-              setPackageNotice(`已从工程 JSON 恢复 ${episodeLabelFromId(projectSnapshot.selectedEpisodeId)}，可继续上次进度。`)
-              setToast({ message: `已恢复工程 JSON：${f.name}` })
-              window.setTimeout(()=>{ setToast(null) }, 3500)
+              setPackageNotice(`已从工程 JSON 恢复 ${episodeLabelFromId(projectSnapshot.selectedEpisodeId)}，请重新上传媒体文件后继续播放与校对。`)
+              setToast({ message: `已恢复工程 JSON：${f.name}，可继续上次标注` })
+              window.setTimeout(()=>{ setToast(null) }, 4200)
               return
+            }
+            if (target === 'project') {
+              throw new Error('这不是工具导出的工程 JSON，请选择 *_review_project.json 或 *_annotation_project.json')
             }
 
             const entries = parseCandidateJSON(raw)
@@ -1167,13 +1194,13 @@ function AppContent(){
             window.setTimeout(()=>{ setToast(null) }, 3500)
           } catch (error) {
             URL.revokeObjectURL(url)
-            setToast({ message: `subseg JSON 解析失败：${error instanceof Error ? error.message : '未知错误'}` })
+            setToast({ message: `${target === 'project' ? '工程 JSON' : 'subseg JSON'} 解析失败：${error instanceof Error ? error.message : '未知错误'}` })
             window.setTimeout(()=>{ setToast(null) }, 5000)
           }
         }
         reader.onerror = () => {
           URL.revokeObjectURL(url)
-          setToast({ message: `无法读取 JSON 文件：${f.name}` })
+          setToast({ message: `无法读取 ${target === 'project' ? '工程 JSON' : 'JSON'} 文件：${f.name}` })
           window.setTimeout(()=>{ setToast(null) }, 5000)
         }
         reader.readAsText(f)
@@ -2649,10 +2676,16 @@ function AppContent(){
             <button className={workMode === 'prepare' ? 'active' : ''} onClick={() => changeWorkMode('prepare')}>准备</button>
             <button className={workMode === 'annotate' ? 'active' : ''} onClick={() => changeWorkMode('annotate')} disabled={!isReadyForAnnotation}>标注</button>
           </div>
+          <button className="btn tiny" onClick={() => projectInputRef.current?.click()}><Upload className="file-icon" />导入工程JSON继续</button>
           <button className="btn tiny" onClick={exportRTTM}><Download className="file-icon" />导出RTTM</button>
-          <button className="btn tiny primary-action" onClick={exportJSON}><Download className="file-icon" />导出工程JSON</button>
+          <button className="btn tiny primary-action" onClick={exportJSON}><Download className="file-icon" />保存进度JSON</button>
         </div>
       </div>
+      <input ref={projectInputRef} type="file" style={{display:'none'}} accept=".json"
+        onChange={(event) => {
+          if (event.target.files) handleFiles(Array.from(event.target.files), 'project')
+          event.currentTarget.value = ''
+        }} />
 
       <div className="layout">
         {/* Left panel: resource loading and checks */}
@@ -2732,22 +2765,29 @@ function AppContent(){
                   <button
                     className="btn tiny"
                     disabled={!draftAvailable}
-                    onClick={() => {
-                      try {
-                        const payload = parseDraftPayload(window.localStorage.getItem(draftStorageKey))
-                        if (!payload) {
-                          setToast({ message: '没有找到本集可恢复的工程草稿' })
-                          window.setTimeout(() => setToast(null), 3000)
-                          return
-                        }
-                        applyDraftPayload(payload, 'manual')
-                      } catch (error) {
-                        setToast({ message: `恢复草稿失败：${error instanceof Error ? error.message : '未知错误'}` })
-                        window.setTimeout(() => setToast(null), 4200)
-                      }
-                    }}
+                    onClick={restoreCurrentEpisodeDraft}
                   >
                     恢复本集草稿
+                  </button>
+                </div>
+              </div>
+              <div className="resume-work-card">
+                <div className="resume-work-title">
+                  <span>继续上次标注</span>
+                  <strong>推荐工程 JSON</strong>
+                </div>
+                <p className="resume-work-note">
+                  长期保存请用导出的工程 JSON；本机草稿只适合同一浏览器临时恢复。恢复工程 JSON 后，仍需重新上传视频/音频用于播放。
+                </p>
+                <div className="resume-work-actions">
+                  <button className="btn tiny primary-action" onClick={() => projectInputRef.current?.click()}>
+                    <Upload className="file-icon" />导入工程JSON继续
+                  </button>
+                  <button className="btn tiny" disabled={!draftAvailable} onClick={restoreCurrentEpisodeDraft}>
+                    恢复本机草稿
+                  </button>
+                  <button className="btn tiny" onClick={exportJSON}>
+                    <Download className="file-icon" />保存当前进度
                   </button>
                 </div>
               </div>
