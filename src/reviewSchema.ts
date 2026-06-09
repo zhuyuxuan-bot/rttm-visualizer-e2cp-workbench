@@ -72,6 +72,7 @@ export interface ReviewProject {
     rttm?: string
     ref_rttm?: string
     srt?: string
+    rttm_kind?: 'standard' | 'initial'
     subseg_match_results?: string
   }
   modality: {
@@ -102,6 +103,7 @@ export function buildEpisodeProject(input: {
   refRTTM: { name?: string } | null
   srt: { name?: string } | null
   candidate?: { name?: string } | null
+  rttmKind?: 'standard' | 'initial'
   speakers: Array<{ id: string; name: string; color: string; visible: boolean }>
   segments: Array<{
     id: string
@@ -174,6 +176,7 @@ export function buildEpisodeProject(input: {
       rttm: input.rttm?.name,
       ref_rttm: input.refRTTM?.name,
       srt: input.srt?.name,
+      rttm_kind: input.rttmKind,
       subseg_match_results: input.candidate?.name,
     },
     modality: {

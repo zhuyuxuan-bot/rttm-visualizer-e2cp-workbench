@@ -1,43 +1,93 @@
-# RTTM 可视化、标注及 DER 诊断工具
+# E2CP RTTM 可视化标注器
 
-[English](README_EN.md) | 中文
+这是面向《三体》对话校准工作的 RTTM 可视化标注工具。它把视频/音频、RTTM 说话人时间段、SRT 字幕、声纹/人脸候选证据放到同一个界面中，帮助标注员完成说话人校对、台词校对、漏句插入、删除多余句、保存工程进度和导出结果。
 
-> 如果觉得这个项目还不错，就点个 star 支持一下叭；也欢迎在 Issues 交流问题。
+## 在线使用
 
-在大规模影视剧数据的说话人标注实践中，研究人员普遍面临两类痛点：（1）参考标注 `ref.rttm` 的构建成本高，且不同来源的 `RTTM` 难以直观核对与校准，导致“边看边改”的人工成本居高不下；（2）数值指标（例如 **DER**）在误差诊断中不够直观，研究者很难跨越一个分值去定位错在何处、错成何类、如何修复。
+如果仓库已启用 GitHub Pages，可以直接打开：
 
-据我们所知，开源社区没有面向研究者可直接加载媒体与 `RTTM` 文件、能以时间轴叠加误差类别的轻量工具。因此，我们基于 `React 18 + TypeScript 5 + Vite` 制作并开源了前端可视化与交互式校对原型。
+```text
+https://zhuyuxuan-bot.github.io/rttm-visualizer-e2cp-workbench/
+```
 
-我们从“可视、可对齐、可编辑、可导出”的最小闭环出发设计并实现如下功能：
+如果页面暂时打不开，请在 GitHub 仓库的 `Settings -> Pages` 中确认来源选择为 `GitHub Actions`，然后等待 `Deploy GitHub Pages` 工作流完成。
 
-![UI](docs/imgs/rttm-visualizer.jpeg)
-
-- 可视与对齐：加载媒体与 `RTTM` 并在统一时间轴对齐；支持 `.srt` 字幕并行预览与检索，用于文本语义比对与时间核查；时间轴以彩色轨道渲染说话人段，支持 0.25–10× 变焦与拖放。
-- DER 误差诊断：并排呈现参考轨与系统轨，叠加 DER 三类误差覆盖层：Missed Speech（蓝）、False Alarm（红）、Speaker Error（橙）；在线计算并展示 `MS/FA/SER/DER`；映射策略基于重叠时长的贪心近似一对一。
-- 交互式标注与轻量编辑：点击创建、拖拽两端调整、右键删除；同说话人相邻段自动防交叠并最小时长约束；说话人图例支持改名、换色、显隐与删除；参考轨可锁定避免误操作。
-- 数据出入与工程闭环：一键导出系统 `RTTM` 与完整工程 `JSON`；支持拖放加载，或在 `exp/raw/` 自动加载首个媒体、在 `exp/rttm/` 自动加载首个 RTTM。
-
-## 运行
+## 本地运行
 
 ```bash
 npm install
-npm run dev
+npm run dev -- --host 127.0.0.1 --port 5175
 ```
 
-## 说话人日志的标准输出格式
+浏览器打开：
 
-RTTM（Rich Transcription Time Marked）被广泛采用，早在 [NIST Rich Transcription](https://catalog.ldc.upenn.edu/docs/LDC2011S06/rt05s-meeting-eval-plan-V1.pdf?utm_source=chatgpt.com) 系列评测任务中正式定义并作为系统输出与参考标注的统一标准使用，并逐步成为说话人日志系统的事实标准格式。
-
-RTTM 是一种空格分隔的文本格式，每行代表一个说话片段（turn），由十个字段构成，例如：
-
-```
-SPEAKER <file_id> 1 <start_time> <duration> <channel_id> <speaker_type> <speaker_name> <confidence> <signal_lookahead>
+```text
+http://127.0.0.1:5175/
 ```
 
-## AI 辅助编程
+## 标注时需要上传什么
 
-本项目一开始开发流程由 AI 工具协助完成，包括 `21st.dev`、`GPT-5` 与 `Cursor` 等；我也在 B 站分享了一部分工作流与 AI 使用心得：[`安如衫`](https://www.bilibili.com/video/BV1BXbPzeEoL/)。更多与 AI 的对话见 `./docs/llm` 目录。
+每一集至少需要：
 
-## 相关
+- 视频或音频：例如 `ep17.mp4`、`17.wav`。
+- 主 RTTM：当前要编辑的说话人时间段文件，例如 `EP17.rttm`。
+- SRT：字幕文件，例如 `ep17_for_review.srt`。
 
-- [modelscope/3D-Speaker](https://github.com/modelscope/3D-Speaker)：说话人验证、识别与日志的 SOTA 工具箱，涵盖实用的标注与评测脚本。
+强烈建议同时上传：
+
+- `subseg_match_results.json`：声纹/人脸候选证据，用于辅助判断说话人。
+- 参考 RTTM：只有在该集有可靠标准 RTTM 时才上传，用于对照，不要误当作主 RTTM。
+
+## 前 15 集和 16-30 集的区别
+
+- 前 15 集：部分集有三模态融合结果，可上传“标准 RTTM”或较可靠 RTTM。
+- 第 08、12、15 集以及 16-30 集：通常没有可直接当标准答案的三模态融合 RTTM，应上传“初始标注 RTTM”，再人工校对。
+- 工具界面会提示当前集应使用“标准 RTTM”还是“初始标注 RTTM”，避免把草稿误当标准答案。
+
+## 标注员快速规则
+
+- 台词正确、说话人正确、时间基本正确：点击 `通过检查`。
+- 说话人错误：点击正确说话人，状态自动进入已修正。
+- 台词文本错误：只在文本输入框中改错字、漏字或错词。
+- 时间不准：拖动时间轴片段边界，或填写开始秒/结束秒。
+- 视频里有声音但列表里没有：用波形框选范围，点击 `插入漏句`。
+- 列表里有一句但视频里不存在：标记为删除，不要手动删原始文件。
+
+更多细节见：[完整使用说明书](docs/USER_MANUAL_ZH.md)。
+
+## 保存进度
+
+工具支持本地自动草稿，但长期保存请使用：
+
+- `导出工程 JSON`：保存完整标注工程，适合下次继续、审计修改、生成最终融合 JSON。
+- `导出 RTTM`：只保存当前说话人时间段，适合下游说话人时间轴处理。
+
+推荐每完成一段标注后导出一次工程 JSON。下次继续时，先恢复工程 JSON，再继续标注。
+
+## 导出前检查
+
+导出前请确认：
+
+- `pending` 数量是否为 0。
+- 是否还有 `uncertain` 或 `UNKNOWN`。
+- 人工插入漏句是否都填写了说话人和文本。
+- 标记删除的句子是否已经复核。
+- 起止时间是否存在异常或重叠。
+
+工具会在导出前报告中提示这些风险。
+
+## 开发者命令
+
+```bash
+npm test
+npm run build
+```
+
+## 文档
+
+- [完整使用说明书](docs/USER_MANUAL_ZH.md)
+- [E2CP 工程 JSON 数据结构](docs/e2cp-workbench-schema.md)
+
+## 数据安全
+
+请不要把 API key、服务器密码、完整版权视频或私人数据提交到 GitHub。仓库可以保留小型示例文件，但正式标注数据应通过本地或服务器工作包管理。

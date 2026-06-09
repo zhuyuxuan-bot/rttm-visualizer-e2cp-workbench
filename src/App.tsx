@@ -9,6 +9,12 @@ import {
 } from './missingInsertSelection'
 import { sanitizeNonJsonNumericTokens } from './candidateJsonSanitizer'
 import { stripSpeakerPrefix } from './dialogueText'
+import {
+  episodeFileMatches,
+  getEpisodeWorkPackage,
+  summarizeBundledEpisodeAssets,
+  type RttmKind,
+} from './episodePackages'
 
 type MediaType = 'audio' | 'video'
 
@@ -107,18 +113,39 @@ interface DraftPayload extends AnnotationSnapshot {
   sourceFiles: {
     media?: string
     rttm?: string
+    rttmKind?: RttmKind
     refRTTM?: string
     srt?: string
     candidate?: string
   }
+  lastPlaybackTime?: number
+  project?: ReturnType<typeof buildEpisodeProject>
+}
+
+interface ExportIssueSummary {
+  total: number
+  pending: number
+  unknownSpeaker: number
+  inserted: number
+  deleted: number
+  corrected: number
+  checked: number
+  uncertain: number
+  emptyInserted: number
+  invalidTime: number
+  missingSpeaker: number
+  suspectedMissingRanges: number
 }
 
 interface ExportIssues {
   blocking: string[]
   warnings: string[]
+  summary: ExportIssueSummary
 }
 
 const DRAFT_SCHEMA_VERSION = 'e2cp.rttm_workbench.draft.v1' as const
+const REVIEW_STATUS_VALUES: ReviewStatus[] = ['pending', 'checked', 'corrected', 'inserted', 'deleted', 'uncertain']
+const SEGMENT_TYPE_VALUES: SegmentType[] = ['dialogue', 'subtitle', 'tail_caption', 'ad', 'unknown']
 const LAST_EPISODE_STORAGE_KEY = 'e2cp-rttm-workbench-last-episode'
 const MAX_HISTORY_STEPS = 80
 const DIALOGUE_ROW_HEIGHT = 76
@@ -155,6 +182,109 @@ function parseDraftPayload(raw: string | null): DraftPayload | null {
   return payload.schemaVersion === DRAFT_SCHEMA_VERSION ? payload : null
 }
 
+function isReviewStatusValue(value: unknown): value is ReviewStatus {
+  return typeof value === 'string' && REVIEW_STATUS_VALUES.includes(value as ReviewStatus)
+}
+
+function isSegmentTypeValue(value: unknown): value is SegmentType {
+  return typeof value === 'string' && SEGMENT_TYPE_VALUES.includes(value as SegmentType)
+}
+
+function isRttmKindValue(value: unknown): value is RttmKind {
+  return value === 'standard' || value === 'initial'
+}
+
+function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
+  const parsed = JSON.parse(raw)
+  const root = asRecord(parsed)
+  if (!root || root.schema_version !== 'e2cp.review_project.v1') return null
+
+  const episode = asRecord(root.episode)
+  const media = asRecord(root.media)
+  const sourceFiles = asRecord(root.source_files)
+  const rawSpeakers = Array.isArray(root.speakers) ? root.speakers : []
+  const rawSegments = Array.isArray(root.segments) ? root.segments : []
+  const palette = ['#3B82F6', '#EF4444', '#10B981', '#F59E0B', '#8B5CF6', '#06B6D4', '#84CC16', '#EC4899']
+
+  const speakers = rawSpeakers.reduce<Speaker[]>((acc, speaker, index) => {
+      const record = asRecord(speaker)
+      if (!record) return acc
+      const id = pickString(record, ['id', 'speaker_id', 'speakerId'])
+      if (!id) return acc
+      acc.push({
+        id,
+        name: pickString(record, ['name', 'speaker_name', 'speakerName']) || id,
+        color: pickString(record, ['color']) || palette[index % palette.length],
+        visible: record.visible !== false,
+        source: 'manual',
+      })
+      return acc
+    }, [])
+
+  const speakerIds = new Set(speakers.map((speaker) => speaker.id))
+  const segments = rawSegments.reduce<Segment[]>((acc, segment, index) => {
+      const record = asRecord(segment)
+      if (!record) return acc
+      const startMs = toNumber(record.start_ms)
+      const endMs = toNumber(record.end_ms)
+      const speakerId = pickString(record, ['speaker_id', 'speakerId', 'speaker']) || 'UNKNOWN'
+      if (startMs === undefined || endMs === undefined) return acc
+      const evidence = asRecord(record.evidence) as SegmentEvidence | null
+      acc.push({
+        id: pickString(record, ['id']) || `project_${index + 1}_${startMs}_${endMs}`,
+        speakerId,
+        start: startMs / 1000,
+        end: Math.max(startMs / 1000 + 0.001, endMs / 1000),
+        text: pickString(record, ['text']) || evidence?.text?.value || '',
+        reviewStatus: isReviewStatusValue(record.review_status) ? record.review_status : 'pending',
+        segmentType: isSegmentTypeValue(record.segment_type) ? record.segment_type : 'dialogue',
+        evidence: evidence || undefined,
+        notes: pickString(record, ['notes']) || '',
+      })
+      return acc
+    }, [])
+    .sort((a, b) => a.start - b.start)
+
+  for (const segment of segments) {
+    if (!speakerIds.has(segment.speakerId)) {
+      speakerIds.add(segment.speakerId)
+      speakers.push({
+        id: segment.speakerId,
+        name: segment.speakerId,
+        color: palette[speakers.length % palette.length],
+        visible: true,
+        source: 'manual',
+      })
+    }
+  }
+
+  const episodeId = normalizeEpisodeId(
+    pickString(episode || {}, ['id', 'title']) ||
+    pickString(media || {}, ['name']) ||
+    pickString(sourceFiles || {}, ['rttm', 'srt']) ||
+    '02',
+  )
+
+  return {
+    schemaVersion: DRAFT_SCHEMA_VERSION,
+    savedAt: new Date().toISOString(),
+    selectedEpisodeId: episodeId,
+    selectedSegId: segments[0]?.id ?? null,
+    sourceFiles: {
+      media: pickString(media || {}, ['name']),
+      rttm: pickString(sourceFiles || {}, ['rttm']),
+      rttmKind: isRttmKindValue(sourceFiles?.rttm_kind) ? sourceFiles.rttm_kind : undefined,
+      refRTTM: pickString(sourceFiles || {}, ['ref_rttm']),
+      srt: pickString(sourceFiles || {}, ['srt']),
+      candidate: pickString(sourceFiles || {}, ['subseg_match_results']),
+    },
+    lastPlaybackTime: segments[0]?.start ?? 0,
+    project: parsed as ReturnType<typeof buildEpisodeProject>,
+    segments,
+    speakers,
+  }
+}
+
 function formatSavedAt(value: string | null): string {
   if (!value) return '等待标注变更'
   const date = new Date(value)
@@ -167,6 +297,7 @@ function buildExportIssues(input: {
   speakers: Speaker[]
   media: MediaFile | null
   rttm: RTTMFile | null
+  rttmKind: RttmKind
   srt: SRTFile | null
   candidateFile: CandidateFile | null
   selectedEpisodeId: string
@@ -181,8 +312,20 @@ function buildExportIssues(input: {
   if (!input.rttm) warnings.push('未加载 RTTM 主文件，当前片段可能不是从标准说话人时间轴开始')
   if (!input.srt) warnings.push('未加载 SRT 字幕，文本校对缺少字幕上下文')
   if (!input.candidateFile) warnings.push('未加载 subseg_match_results.json，声纹/人脸候选证据不可见')
+  if (input.rttmKind === 'initial') warnings.push('当前主 RTTM 类型是“初始标注 RTTM”，不要当作标准答案直接发布')
 
-  const pendingCount = input.segments.filter((segment) => (segment.reviewStatus || 'pending') === 'pending').length
+  const statusCount = (status: ReviewStatus) => input.segments.filter((segment) => (segment.reviewStatus || 'pending') === status).length
+  const pendingCount = statusCount('pending')
+  const insertedCount = statusCount('inserted')
+  const deletedCount = statusCount('deleted')
+  const correctedCount = statusCount('corrected')
+  const checkedCount = statusCount('checked')
+  const uncertainCount = statusCount('uncertain')
+  const unknownSpeakerCount = input.segments.filter((segment) => {
+    const speaker = input.speakers.find((item) => item.id === segment.speakerId)
+    const label = `${segment.speakerId} ${speaker?.name || ''}`.toUpperCase()
+    return label.includes('UNKNOWN') || label.includes('未知')
+  }).length
   const emptyInsertedCount = input.segments.filter((segment) => (
     segment.reviewStatus === 'inserted' && !(segment.text || segment.evidence?.text?.value || '').trim()
   )).length
@@ -196,6 +339,8 @@ function buildExportIssues(input: {
   if (invalidTimeCount > 0) blocking.push(`${invalidTimeCount} 条片段时间不合法`)
   if (missingSpeakerCount > 0) blocking.push(`${missingSpeakerCount} 条片段引用了不存在的说话人`)
   if (pendingCount > 0) warnings.push(`${pendingCount} 条片段仍是 pending`)
+  if (unknownSpeakerCount > 0) warnings.push(`${unknownSpeakerCount} 条片段说话人仍是 UNKNOWN/未知`)
+  if (deletedCount > 0) warnings.push(`${deletedCount} 条片段已标记删除，导出 RTTM 时会跳过`)
   if (emptyInsertedCount > 0) warnings.push(`${emptyInsertedCount} 条人工插入片段还没有填写文本`)
   if (input.waveMissingRanges.length > 0) warnings.push(`波峰仍提示 ${input.waveMissingRanges.length} 个疑似遗漏区间`)
 
@@ -205,7 +350,24 @@ function buildExportIssues(input: {
     warnings.push(`已选 ${selectedEpisode}，但部分源文件名不像这一集`)
   }
 
-  return { blocking, warnings }
+  return {
+    blocking,
+    warnings,
+    summary: {
+      total: input.segments.length,
+      pending: pendingCount,
+      unknownSpeaker: unknownSpeakerCount,
+      inserted: insertedCount,
+      deleted: deletedCount,
+      corrected: correctedCount,
+      checked: checkedCount,
+      uncertain: uncertainCount,
+      emptyInserted: emptyInsertedCount,
+      invalidTime: invalidTimeCount,
+      missingSpeaker: missingSpeakerCount,
+      suspectedMissingRanges: input.waveMissingRanges.length,
+    },
+  }
 }
 
 
@@ -390,14 +552,7 @@ function getInitialEpisodeId(): string {
 }
 
 function fileMatchesEpisode(name: string | undefined, episodeId: string): boolean {
-  if (!name) return false
-  const normalized = normalizeEpisodeId(episodeId)
-  const patterns = [
-    new RegExp(`\\bep[\\s_-]*0?${Number(normalized)}\\b`, 'i'),
-    new RegExp(`(?:^|[^\\d])0?${Number(normalized)}(?:[._\\-\\s]|$)`, 'i'),
-    new RegExp(`第\\s*0?${Number(normalized)}\\s*[集话話]`, 'i'),
-  ]
-  return patterns.some((pattern) => pattern.test(name))
+  return episodeFileMatches(name, episodeId)
 }
 
 function normalizeCandidateFace(raw: unknown): CandidateFace {
@@ -569,7 +724,7 @@ function AppContent(){
   const [videoAreaHeight, setVideoAreaHeight] = useState<number>(400)
   const resizeStateRef = useRef<{startY:number; startH:number} | null>(null)
   const isScrubbingRef = useRef(false)
-  const defaultLoadedRef = useRef(false)
+  const lastAutoLoadedEpisodeRef = useRef<string | null>(null)
   const bootDraftCheckedRef = useRef(false)
   const bootDraftRestoredRef = useRef(false)
   const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
@@ -577,6 +732,7 @@ function AppContent(){
   const [segmentTextDraft, setSegmentTextDraft] = useState('')
   const [segmentNotesDraft, setSegmentNotesDraft] = useState('')
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
+  const [packageNotice, setPackageNotice] = useState('')
   const [missingInsertDraft, setMissingInsertDraft] = useState({ start: '', end: '', text: '', speakerId: '' })
   const [missingPickMode, setMissingPickMode] = useState<MissingTimePickMode>('idle')
   const [missingRangePreview, setMissingRangePreview] = useState<{ start: number; end: number } | null>(null)
@@ -591,6 +747,7 @@ function AppContent(){
   const pendingTimeProbeRef = useRef<{ time: number; clientX: number; speakerName?: string } | null>(null)
   const missingRangePreviewFrameRef = useRef<number | null>(null)
   const pendingMissingRangePreviewRef = useRef<{ start: number; end: number } | null>(null)
+  const waveMissingRangesRef = useRef<Array<{ start: number; end: number }>>([])
   const ghostSegFrameRef = useRef<number | null>(null)
   const pendingGhostSegRef = useRef<{speakerId:string; start:number; end:number} | null>(null)
   const lastGhostSegRef = useRef<{speakerId:string; start:number; end:number} | null>(null)
@@ -616,6 +773,13 @@ function AppContent(){
     () => speakers.find((speaker) => speaker.id === selectedSegment?.speakerId) ?? null,
     [speakers, selectedSegment?.speakerId],
   )
+  const episodePackage = useMemo(
+    () => getEpisodeWorkPackage(selectedEpisodeId),
+    [selectedEpisodeId],
+  )
+  const rttmKind = episodePackage.rttmKind
+  const rttmKindLabel = episodePackage.rttmLabel
+  const isInitialRttmPackage = rttmKind === 'initial'
   const speakerTextLabels = useMemo(
     () => Array.from(new Set(speakers.flatMap((speaker) => [speaker.name, speaker.id]).filter(Boolean))),
     [speakers],
@@ -885,10 +1049,24 @@ function AppContent(){
         sourceFiles: {
           media: media?.name,
           rttm: rttm?.name,
+          rttmKind,
           refRTTM: refRTTM?.name,
           srt: srt?.name,
           candidate: candidateFile?.name,
         },
+        lastPlaybackTime: videoRef.current?.currentTime ?? currentTime,
+        project: buildEpisodeProject({
+          media: media ? { ...media, duration } : null,
+          rttm,
+          refRTTM,
+          srt,
+          candidate: candidateFile,
+          rttmKind,
+          speakers: speakersRef.current,
+          segments: segmentsRef.current,
+          refSegments,
+          missingRanges: waveMissingRangesRef.current,
+        }),
         ...buildAnnotationSnapshot(segmentsRef.current, speakersRef.current),
       }
       try {
@@ -901,13 +1079,17 @@ function AppContent(){
       }
     }, 700)
     return () => window.clearTimeout(timer)
-  }, [candidateFile?.name, draftStorageKey, media?.name, refRTTM?.name, rttm?.name, selectedEpisodeId, selectedSegId, segments, speakers, srt?.name])
+  }, [candidateFile, draftStorageKey, duration, media, refRTTM, refSegments, rttm, rttmKind, selectedEpisodeId, selectedSegId, segments, speakers, srt])
 
   const applyDraftPayload = useCallback((payload: DraftPayload, mode: 'auto' | 'manual') => {
     restoreAnnotationSnapshot(payload)
     setLastDraftSavedAt(payload.savedAt)
     setDraftAvailable(true)
     setSelectedSegId(payload.selectedSegId)
+    if (typeof payload.lastPlaybackTime === 'number' && Number.isFinite(payload.lastPlaybackTime)) {
+      setCurrentTime(payload.lastPlaybackTime)
+      if (videoRef.current) videoRef.current.currentTime = payload.lastPlaybackTime
+    }
     setToast({
       message: mode === 'auto'
         ? `已自动恢复 ${episodeLabelFromId(payload.selectedEpisodeId)} 的上次标注草稿`
@@ -954,7 +1136,29 @@ function AppContent(){
         const reader = new FileReader()
         reader.onload = () => {
           try {
-            const entries = parseCandidateJSON(String(reader.result))
+            const raw = String(reader.result)
+            let projectSnapshot: DraftPayload | null = null
+            try {
+              projectSnapshot = parseReviewProjectSnapshot(raw)
+            } catch {
+              projectSnapshot = null
+            }
+            if (projectSnapshot) {
+              URL.revokeObjectURL(url)
+              episodeManuallySelectedRef.current = true
+              setSelectedEpisodeId(projectSnapshot.selectedEpisodeId)
+              restoreAnnotationSnapshot(projectSnapshot)
+              setSelectedSegId(projectSnapshot.selectedSegId)
+              if (projectSnapshot.sourceFiles.rttm) {
+                setRTTM({ id: 'project-rttm', name: projectSnapshot.sourceFiles.rttm, url: '', matched: true })
+              }
+              setPackageNotice(`已从工程 JSON 恢复 ${episodeLabelFromId(projectSnapshot.selectedEpisodeId)}，可继续上次进度。`)
+              setToast({ message: `已恢复工程 JSON：${f.name}` })
+              window.setTimeout(()=>{ setToast(null) }, 3500)
+              return
+            }
+
+            const entries = parseCandidateJSON(raw)
             if (entries.length === 0) {
               throw new Error('没有解析到候选片段，请确认这是 subseg_match_results.json 或包含 top_5_speakers/top_5_faces 的 JSON')
             }
@@ -1166,6 +1370,13 @@ function AppContent(){
     () => filteredSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === 'pending').length,
     [filteredSegmentRows],
   )
+  const bundledEpisodeAssets = useMemo(() => summarizeBundledEpisodeAssets({
+    episodeId: selectedEpisodeId,
+    mediaKeys: Object.keys(defaultMediaFiles),
+    rttmKeys: Object.keys(defaultRttmFiles),
+    srtKeys: Object.keys(defaultSrtFiles),
+    subsegKeys: Object.keys(defaultCandidateFiles),
+  }), [selectedEpisodeId])
   // right panel auto collapse/expand logic based on data presence
   const hasRTTM = useMemo(()=> (!!rttm) || speakers.length>0, [rttm, speakers.length])
   const hasRef = useMemo(()=> (!!refRTTM) || refSegments.length>0, [refRTTM, refSegments.length])
@@ -1197,10 +1408,12 @@ function AppContent(){
       },
       {
         key: 'rttm',
-        label: 'RTTM',
+        label: rttmKindLabel,
         required: true,
         name: rttm?.name,
-        detail: rttm ? `${segments.length} segments` : '说话人时间段主文件',
+        detail: rttm
+          ? `${segments.length} segments · ${rttmKindLabel}`
+          : `${rttmKindLabel}：${episodePackage.expected.rttm.join(' / ')}`,
         state: makeState(rttm?.name),
         action: () => rttmInputRef.current?.click(),
       },
@@ -1218,7 +1431,9 @@ function AppContent(){
         label: 'subseg JSON',
         required: false,
         name: candidateFile?.name,
-        detail: candidateFile ? `${candidateFile.entries.length} matches` : '声纹/人脸候选证据，强烈建议加载',
+        detail: candidateFile
+          ? `${candidateFile.entries.length} matches`
+          : `声纹/人脸候选证据，建议：${episodePackage.expected.subseg[0]}`,
         state: candidateFile ? 'loaded' : 'optional-missing',
         action: () => candidateInputRef.current?.click(),
       },
@@ -1232,7 +1447,7 @@ function AppContent(){
         action: () => refRttmInputRef.current?.click(),
       },
     ] as const
-  }, [candidateFile, duration, media, refRTTM, refSegments.length, rttm, segments.length, selectedEpisodeId, srt])
+  }, [candidateFile, duration, episodePackage, media, refRTTM, refSegments.length, rttm, rttmKindLabel, segments.length, selectedEpisodeId, srt])
   const missingRequiredCount = useMemo(
     () => episodeRequirementRows.filter((row) => row.required && row.state !== 'loaded').length,
     [episodeRequirementRows],
@@ -1347,43 +1562,49 @@ function AppContent(){
     setDuration(el.duration || 0)
   }
 
-  // Load default media and RTTM from exp/ folders on first mount
+  // Load bundled episode work-package files from exp/ folders when the episode changes.
   useEffect(()=>{
-    if(defaultLoadedRef.current) return
-    defaultLoadedRef.current = true
+    if(lastAutoLoadedEpisodeRef.current === selectedEpisodeId) return
+    lastAutoLoadedEpisodeRef.current = selectedEpisodeId
     try {
-      const restoredDraft = bootDraftRestoredRef.current
-      const pickEpisodeFile = (keys: string[]) => {
-        const matched = keys.find((key) => fileMatchesEpisode(key.split('/').pop() || key, selectedEpisodeId))
-        return matched || (restoredDraft ? undefined : keys[0])
-      }
+      const restoredDraft = bootDraftRestoredRef.current && !episodeManuallySelectedRef.current
+      const loaded: string[] = []
+      const missing: string[] = []
+      const episodeKeys = (keys: string[]) => keys.filter((key) => {
+        const fileName = key.split('/').pop() || key
+        return fileMatchesEpisode(fileName, selectedEpisodeId)
+      })
+
       const mediaKeys = Object.keys(defaultMediaFiles).sort()
+      const episodeMediaKeys = episodeKeys(mediaKeys)
       if(mediaKeys.length > 0){
-        const episodeMediaKeys = mediaKeys.filter((key) => fileMatchesEpisode(key.split('/').pop() || key, selectedEpisodeId))
-        const mediaPool = episodeMediaKeys.length > 0 ? episodeMediaKeys : (restoredDraft ? [] : mediaKeys)
-        const mp4First = mediaPool.find(k=>/\.mp4$/i.test(k)) || mediaPool[0]
+        const mp4First = episodeMediaKeys.find(k=>/\.mp4$/i.test(k)) || episodeMediaKeys[0]
         if (mp4First) {
           const url = defaultMediaFiles[mp4First]
           const name = mp4First.split('/').pop() || 'media'
           const type: MediaType = /\.(mp4|webm)$/i.test(name) ? 'video' : 'audio'
           setMedia({ id: 'default-media', name, type, url })
           const mediaBase = name.replace(/\.[^/.]+$/, '').toLowerCase()
-          const audioFirst = mediaKeys.find((key) => {
+          const audioFirst = episodeMediaKeys.find((key) => {
             const fileName = key.split('/').pop() || ''
             return /\.(wav|mp3|m4a)$/i.test(fileName) && fileName.replace(/\.[^/.]+$/, '').toLowerCase() === mediaBase
-          }) || mediaKeys.find((key) => /\.(wav|mp3|m4a)$/i.test(key)) || mp4First
+          }) || episodeMediaKeys.find((key) => /\.(wav|mp3|m4a)$/i.test(key)) || mp4First
           setWaveformSource({
             url: defaultMediaFiles[audioFirst],
             name: audioFirst.split('/').pop() || name,
           })
-        } else if (restoredDraft) {
+          loaded.push('媒体')
+        } else if (!restoredDraft) {
           setMedia(null)
           setWaveformSource(null)
+          missing.push('媒体')
         }
       }
+
       const rttmKeys = Object.keys(defaultRttmFiles).sort()
+      const episodeRttmKeys = episodeKeys(rttmKeys)
       if(rttmKeys.length > 0 && !restoredDraft){
-        const firstPath = pickEpisodeFile(rttmKeys)
+        const firstPath = episodeRttmKeys[0]
         if (firstPath) {
           const content = defaultRttmFiles[firstPath]
           const name = firstPath.split('/').pop() || 'segments.rttm'
@@ -1393,11 +1614,21 @@ function AppContent(){
           const blob = new Blob([content], {type:'text/plain'})
           const url = URL.createObjectURL(blob)
           setRTTM({ id: 'default-rttm', name, url, matched: true })
+          loaded.push(rttmKindLabel)
+        } else {
+          setSegments([])
+          setSpeakers([])
+          setRTTM(null)
+          missing.push(rttmKindLabel)
         }
+      } else if (restoredDraft) {
+        missing.push('RTTM 原文件需按需重新上传')
       }
+
       const srtKeys = Object.keys(defaultSrtFiles).sort()
+      const episodeSrtKeys = episodeKeys(srtKeys)
       if(srtKeys.length > 0){
-        const firstPath = pickEpisodeFile(srtKeys)
+        const firstPath = episodeSrtKeys[0]
         if (firstPath) {
           const content = defaultSrtFiles[firstPath]
           const name = firstPath.split('/').pop() || 'subtitles.srt'
@@ -1405,13 +1636,17 @@ function AppContent(){
           const blob = new Blob([content], {type:'text/plain'})
           const url = URL.createObjectURL(blob)
           setSRT({ id: 'default-srt', name, url, subtitles })
+          loaded.push('SRT')
+        } else if (!restoredDraft) {
+          setSRT(null)
+          missing.push('SRT')
         }
       }
+
       const candidateKeys = Object.keys(defaultCandidateFiles).sort()
+      const episodeCandidateKeys = episodeKeys(candidateKeys)
       if(candidateKeys.length > 0){
-        const episodeCandidateKeys = candidateKeys.filter((key) => fileMatchesEpisode(key.split('/').pop() || key, selectedEpisodeId))
-        const candidatePool = episodeCandidateKeys.length > 0 ? episodeCandidateKeys : (restoredDraft ? [] : candidateKeys)
-        const preferredPath = candidatePool.find((key) => /subseg|match/i.test(key)) || candidatePool[0]
+        const preferredPath = episodeCandidateKeys.find((key) => /subseg|match/i.test(key)) || episodeCandidateKeys[0]
         if (preferredPath) {
           const content = defaultCandidateFiles[preferredPath]
           const name = preferredPath.split('/').pop() || 'subseg_match_results.json'
@@ -1419,12 +1654,20 @@ function AppContent(){
           const blob = new Blob([content], {type:'application/json'})
           const url = URL.createObjectURL(blob)
           setCandidateFile({ id: 'default-candidate-json', name, url, entries })
+          loaded.push('subseg JSON')
+        } else if (!restoredDraft) {
+          setCandidateFile(null)
+          missing.push('subseg JSON')
         }
       }
+
+      const loadedText = loaded.length > 0 ? loaded.join('、') : '未找到本地匹配文件'
+      const missingText = missing.length > 0 ? missing.join('、') : '无'
+      setPackageNotice(`${episodePackage.label} 工作包：已自动加载 ${loadedText}；仍需上传 ${missingText}。`)
     } catch (e) {
-      // ignore
+      setPackageNotice(`工作包自动加载失败：${e instanceof Error ? e.message : '未知错误'}`)
     }
-  }, [selectedEpisodeId])
+  }, [episodePackage.label, rttmKindLabel, selectedEpisodeId])
 
   // Keep playback UI responsive without forcing a full React render every frame.
   useEffect(()=>{
@@ -1914,7 +2157,7 @@ function AppContent(){
     }, { preserveRange: true })
     setSelectedSegId(id)
     seek(range.start)
-    setToast({ message: '漏句已加入时间轴；请导出 RTTM 或工程 JSON 保存到文件' })
+    setToast({ message: '漏句已加入时间轴、右侧列表和工程草稿；导出时会进入 RTTM/JSON' })
     window.setTimeout(() => setToast(null), 4200)
   }
 
@@ -1952,7 +2195,7 @@ function AppContent(){
     missingRangeAnchorRef.current = null
     setSelectedSegId(id)
     seek(start)
-    setToast({ message: '漏句已加入时间轴和台词列表；请导出 RTTM 或工程 JSON 保存到文件' })
+    setToast({ message: '漏句已加入时间轴、右侧列表和工程草稿；导出时会进入 RTTM/JSON' })
     window.setTimeout(() => setToast(null), 4200)
   }
 
@@ -2030,6 +2273,7 @@ function AppContent(){
       speakers,
       media,
       rttm,
+      rttmKind,
       srt,
       candidateFile,
       selectedEpisodeId,
@@ -2057,6 +2301,7 @@ function AppContent(){
       refRTTM,
       srt,
       candidate: candidateFile,
+      rttmKind,
       speakers,
       segments,
       refSegments,
@@ -2076,6 +2321,7 @@ function AppContent(){
     const lines = segments
       .slice()
       .sort((a,b)=> a.start-b.start)
+      .filter((seg) => seg.reviewStatus !== 'deleted')
       .map(seg => {
         const dur = Math.max(MIN_DUR, seg.end - seg.start)
         const label = speakers.find(s=> s.id===seg.speakerId)?.name || seg.speakerId
@@ -2244,6 +2490,20 @@ function AppContent(){
       .filter((range) => !srt?.subtitles.some((subtitle) => overlaps(range, subtitle) >= 0.35))
       .slice(0, 200)
   }, [segments, srt, wavePeaks])
+  waveMissingRangesRef.current = waveMissingRanges
+
+  const currentExportIssues = useMemo(() => buildExportIssues({
+    segments,
+    speakers,
+    media,
+    rttm,
+    rttmKind,
+    srt,
+    candidateFile,
+    selectedEpisodeId,
+    waveMissingRanges,
+  }), [candidateFile, media, rttm, rttmKind, selectedEpisodeId, segments, speakers, srt, waveMissingRanges])
+  const exportReportPrimaryIssue = currentExportIssues.blocking[0] || currentExportIssues.warnings[0] || '导出前检查未发现明显缺口'
 
   const waveformChunkSeconds = useMemo(() => {
     return Math.max(1, WAVEFORM_MAX_CHUNK_WIDTH / pxPerSec)
@@ -2375,10 +2635,13 @@ function AppContent(){
         <div className="topbar-status">
           <span className="status-chip selected-chip">{episodeLabelFromId(selectedEpisodeId)}</span>
           <span className={`status-chip ${media ? 'ok' : 'blocked'}`}>媒体 {media ? '已加载' : '缺失'}</span>
-          <span className={`status-chip ${hasRTTM ? 'ok' : 'blocked'}`}>RTTM {hasRTTM ? '已加载' : '缺失'}</span>
+          <span className={`status-chip ${hasRTTM ? (isInitialRttmPackage ? 'warn' : 'ok') : 'blocked'}`}>{rttmKindLabel} {hasRTTM ? '已加载' : '缺失'}</span>
           <span className={`status-chip ${hasSRT ? 'ok' : 'blocked'}`}>SRT {hasSRT ? '已加载' : '缺失'}</span>
           <span className="status-chip">进度 {reviewProgress.reviewed} / {reviewProgress.total}</span>
           <span className="status-chip warn">当前筛选待处理 {filteredPendingCount}</span>
+          <span className="status-chip warn">UNKNOWN {currentExportIssues.summary.unknownSpeaker}</span>
+          <span className="status-chip">漏句 {currentExportIssues.summary.inserted}</span>
+          <span className="status-chip">删除 {currentExportIssues.summary.deleted}</span>
           <span className={`status-chip ${draftAvailable ? 'ok' : ''}`}>自动草稿 {formatSavedAt(lastDraftSavedAt)}</span>
         </div>
         <div className="topbar-actions">
@@ -2435,6 +2698,19 @@ function AppContent(){
                     : `还缺 ${missingRequiredCount} 个必需文件`}
                 </span>
               </div>
+              <div className={`work-package-card ${isInitialRttmPackage ? 'initial' : 'standard'}`}>
+                <div className="work-package-title">
+                  <span>{episodePackage.label} · {episodePackage.modalityLabel}</span>
+                  <strong>{rttmKindLabel}</strong>
+                </div>
+                <div className="package-asset-grid">
+                  <span>媒体 {bundledEpisodeAssets.media}</span>
+                  <span>RTTM {bundledEpisodeAssets.rttm}</span>
+                  <span>SRT {bundledEpisodeAssets.srt}</span>
+                  <span>subseg {bundledEpisodeAssets.subseg}</span>
+                </div>
+                <p>{packageNotice || episodePackage.note}</p>
+              </div>
               <div className="review-progress-card">
                 <div className="row" style={{justifyContent:'space-between'}}>
                   <span>标注进度</span>
@@ -2451,6 +2727,44 @@ function AppContent(){
                   <span>inserted {reviewProgress.counts.inserted}</span>
                   <span>uncertain {reviewProgress.counts.uncertain}</span>
                 </div>
+                <div className="autosave-line">
+                  <span>工程 JSON 草稿：{formatSavedAt(lastDraftSavedAt)}</span>
+                  <button
+                    className="btn tiny"
+                    disabled={!draftAvailable}
+                    onClick={() => {
+                      try {
+                        const payload = parseDraftPayload(window.localStorage.getItem(draftStorageKey))
+                        if (!payload) {
+                          setToast({ message: '没有找到本集可恢复的工程草稿' })
+                          window.setTimeout(() => setToast(null), 3000)
+                          return
+                        }
+                        applyDraftPayload(payload, 'manual')
+                      } catch (error) {
+                        setToast({ message: `恢复草稿失败：${error instanceof Error ? error.message : '未知错误'}` })
+                        window.setTimeout(() => setToast(null), 4200)
+                      }
+                    }}
+                  >
+                    恢复本集草稿
+                  </button>
+                </div>
+              </div>
+              <div className={`export-report-card ${currentExportIssues.blocking.length > 0 ? 'blocked' : currentExportIssues.warnings.length > 0 ? 'warn' : 'ready'}`}>
+                <div className="work-package-title">
+                  <span>导出前检查</span>
+                  <strong>{currentExportIssues.blocking.length > 0 ? '需处理' : currentExportIssues.warnings.length > 0 ? '有提醒' : '可导出'}</strong>
+                </div>
+                <div className="export-report-grid">
+                  <span>pending {currentExportIssues.summary.pending}</span>
+                  <span>UNKNOWN {currentExportIssues.summary.unknownSpeaker}</span>
+                  <span>漏句 {currentExportIssues.summary.inserted}</span>
+                  <span>删除 {currentExportIssues.summary.deleted}</span>
+                  <span>空漏句 {currentExportIssues.summary.emptyInserted}</span>
+                  <span>疑似波峰 {currentExportIssues.summary.suspectedMissingRanges}</span>
+                </div>
+                <p>{exportReportPrimaryIssue}</p>
               </div>
               {currentEpisodeLabel !== '未识别' && currentEpisodeLabel !== episodeLabelFromId(selectedEpisodeId) && (
                 <div className="wizard-warning">
@@ -3217,7 +3531,7 @@ function AppContent(){
                           {missingPickMode === 'start' && '请点击左侧波形/时间轴，自动填入漏句开始秒。'}
                           {missingPickMode === 'end' && '请点击左侧波形/时间轴，自动填入漏句结束秒。'}
                           {missingPickMode === 'range' && '请在左侧波形/时间轴拖拽一段范围，自动填入开始秒和结束秒。'}
-                          {missingPickMode === 'idle' && '需要补漏句时，可先用“取开始点 / 取结束点 / 框选漏句”减少手动输入。'}
+                          {missingPickMode === 'idle' && '需要补漏句时，可先框选波形再点“插入漏句”；插入后会立刻进入时间轴、右侧列表、工程草稿和导出结果。'}
                         </div>
                         <div className="missing-insert-grid">
                           <label className="field">
