@@ -9,6 +9,7 @@ import {
 } from './missingInsertSelection'
 import { sanitizeNonJsonNumericTokens } from './candidateJsonSanitizer'
 import { stripSpeakerPrefix } from './dialogueText'
+import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
 import {
   episodeFileMatches,
   getEpisodeWorkPackage,
@@ -1540,16 +1541,6 @@ function AppContent(){
   const markSelectedAsChecked = () => {
     if (!selectedSegId) return
     updateSelectedSegment({ reviewStatus: 'checked' })
-    const anchor = selectedSegment?.start ?? currentTime
-    const pendingRows = sortedSegmentRows.filter(({ segment }) => (
-      segment.id !== selectedSegId && (segment.reviewStatus || 'pending') === 'pending'
-    ))
-    const afterCurrent = pendingRows.find(({ segment }) => segment.start > anchor + 0.03)
-    const target = afterCurrent || pendingRows[0]
-    if (target) {
-      setSelectedSegId(target.segment.id)
-      seek(target.segment.start)
-    }
   }
   const assignSelectedSpeaker = (speaker: Speaker) => {
     if (!selectedSegment) return
@@ -1731,24 +1722,19 @@ function AppContent(){
   // keyboard
   useEffect(()=>{
     const onKey = (e: KeyboardEvent) => {
-      const active = document.activeElement as HTMLElement | null
-      const isEditable = !!active && (
-        active.tagName === 'INPUT' ||
-        active.tagName === 'TEXTAREA' ||
-        active.isContentEditable ||
-        !!active.closest('input, textarea, [contenteditable="true"]')
-      )
-      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !isEditable){
+      const suppressGlobalShortcut = shouldSuppressGlobalShortcut(e, document.activeElement)
+      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !suppressGlobalShortcut){
         e.preventDefault()
         if(e.shiftKey) redoAnnotation()
         else undoAnnotation()
         return
       }
-      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !isEditable){
+      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !suppressGlobalShortcut){
         e.preventDefault()
         redoAnnotation()
         return
       }
+      if(suppressGlobalShortcut) return
       if(e.code === 'Space'){ console.log('Space'); e.preventDefault(); togglePlay() }
       if(e.key === 'ArrowLeft'){ console.log('ArrowLeft'); seek(currentTime - 1) }
       if(e.key === 'ArrowRight'){ console.log('ArrowRight'); seek(currentTime + 1) }
@@ -1757,7 +1743,6 @@ function AppContent(){
       if(e.key === 'Delete' || e.key === 'Backspace'){
         console.log('Delete/Backspace pressed, selectedSegId=', selectedSegId)
         // Ignore Delete when user is typing in an editable element
-        if(isEditable){ console.log('Editable focused, skip'); return }
         if(selectedSegId && !confirmDelete){
           e.preventDefault();
           console.log('Open confirm delete for', selectedSegId)
