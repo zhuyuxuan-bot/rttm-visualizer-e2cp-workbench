@@ -85,6 +85,7 @@ export interface ReviewProject {
     name: string
     color: string
     visible: boolean
+    source?: 'rttm' | 'manual' | 'candidate'
   }>
   segments: ReviewSegment[]
   ref_segments: ReviewSegment[]
@@ -104,7 +105,7 @@ export function buildEpisodeProject(input: {
   srt: { name?: string } | null
   candidate?: { name?: string } | null
   rttmKind?: 'standard' | 'initial'
-  speakers: Array<{ id: string; name: string; color: string; visible: boolean }>
+  speakers: Array<{ id: string; name: string; color: string; visible: boolean; source?: 'rttm' | 'manual' | 'candidate' }>
   segments: Array<{
     id: string
     speakerId: string

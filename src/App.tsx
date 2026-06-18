@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Download, Github, Plus } from 'lucide-react'
+import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Download, Github, Plus, Trash2 } from 'lucide-react'
 import { computeDER, type ErrorInterval, type DERMetrics } from './utils'
 import { buildEpisodeProject, type ReviewStatus, type SegmentEvidence, type SegmentType } from './reviewSchema'
 import {
@@ -99,6 +99,11 @@ interface Speaker {
   color: string
   visible: boolean
   source?: 'rttm' | 'manual' | 'candidate'
+}
+
+function normalizeSpeakerSource(value?: string): Speaker['source'] | undefined {
+  if (value === 'rttm' || value === 'manual' || value === 'candidate') return value
+  return undefined
 }
 
 interface AnnotationSnapshot {
@@ -217,7 +222,7 @@ function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
         name: pickString(record, ['name', 'speaker_name', 'speakerName']) || id,
         color: pickString(record, ['color']) || palette[index % palette.length],
         visible: record.visible !== false,
-        source: 'manual',
+        source: normalizeSpeakerSource(pickString(record, ['source'])),
       })
       return acc
     }, [])
@@ -470,7 +475,7 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
     })
     if(!speakerIndex.has(spk)){
       const color = colorPalette[colorPtr % colorPalette.length]; colorPtr++
-      speakerIndex.set(spk, { id: spk, name: spk, color, visible: true })
+      speakerIndex.set(spk, { id: spk, name: spk, color, visible: true, source: 'rttm' })
     }
   }
   const speakers = Array.from(speakerIndex.values())
@@ -794,6 +799,13 @@ function AppContent(){
     }
     return map
   }, [segments])
+  const speakerUsageCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const segment of segments) {
+      counts.set(segment.speakerId, (counts.get(segment.speakerId) || 0) + 1)
+    }
+    return counts
+  }, [segments])
   useEffect(() => {
     setQuickSpeakerOpen(false)
   }, [selectedSegId])
@@ -934,6 +946,22 @@ function AppContent(){
   const [confirmDelete, setConfirmDelete] = useState<{open: boolean; segId: string} | null>(null)
   const lastDeletedRef = useRef<Segment | null>(null)
   const [toast, setToast] = useState<{message: string; actionLabel?: string; onAction?: ()=>void} | null>(null)
+  const removeManualSpeaker = useCallback((speaker: Speaker) => {
+    const usedCount = speakerUsageCounts.get(speaker.id) || 0
+    if (speaker.source !== 'manual') {
+      setToast({ message: '只能删除人工新增的说话人，RTTM 原始说话人请保留。' })
+      window.setTimeout(() => setToast(null), 3600)
+      return
+    }
+    if (usedCount > 0) {
+      setToast({ message: `无法删除「${speaker.name}」：已有 ${usedCount} 个片段使用它，请先把这些片段改成其他说话人。` })
+      window.setTimeout(() => setToast(null), 5200)
+      return
+    }
+    setSpeakers((prev) => prev.filter((item) => item.id !== speaker.id))
+    setToast({ message: `已删除人工新增说话人「${speaker.name}」。` })
+    window.setTimeout(() => setToast(null), 3200)
+  }, [speakerUsageCounts])
   const historyRef = useRef<AnnotationSnapshot[]>([])
   const historyCursorRef = useRef(-1)
   const historySkipRef = useRef(false)
@@ -2154,7 +2182,7 @@ function AppContent(){
     if (!speakers.some((speaker) => speaker.id === speakerId)) {
       setSpeakers((prev) => [
         ...prev,
-        { id: speakerId, name: speakerId, color: '#8B5CF6', visible: true },
+        { id: speakerId, name: speakerId, color: '#8B5CF6', visible: true, source: 'manual' },
       ])
     }
     const id = createSegmentAt(speakerId, range.start, {
@@ -3364,17 +3392,42 @@ function AppContent(){
                           {speakers.length === 0 && (
                             <div className="badge-sm">暂无说话人，可在下方新增。</div>
                           )}
-                          {speakers.map((speaker) => (
-                            <button
-                              key={speaker.id}
-                              className={`speaker-chip${speaker.id === selectedSegment.speakerId ? ' active' : ''}`}
-                              onClick={() => assignSelectedSpeaker(speaker)}
-                              title={`将当前片段标为 ${speaker.name}`}
-                            >
-                              <span style={{background: speaker.color}} />
-                              {speaker.name}
-                            </button>
-                          ))}
+                          {speakers.map((speaker) => {
+                            const usageCount = speakerUsageCounts.get(speaker.id) || 0
+                            const isManualSpeaker = speaker.source === 'manual'
+                            return (
+                              <div
+                                key={speaker.id}
+                                className={`speaker-chip-shell${speaker.id === selectedSegment.speakerId ? ' active' : ''}${isManualSpeaker ? ' manual' : ''}`}
+                              >
+                                <button
+                                  type="button"
+                                  className="speaker-chip"
+                                  onClick={() => assignSelectedSpeaker(speaker)}
+                                  title={`将当前片段标为 ${speaker.name}`}
+                                >
+                                  <span style={{background: speaker.color}} />
+                                  {speaker.name}
+                                </button>
+                                {isManualSpeaker && (
+                                  <button
+                                    type="button"
+                                    className={`speaker-chip-delete${usageCount > 0 ? ' blocked' : ''}`}
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      removeManualSpeaker(speaker)
+                                    }}
+                                    title={usageCount > 0
+                                      ? `已有 ${usageCount} 个片段使用该说话人，先改掉这些片段再删除`
+                                      : `删除人工新增说话人 ${speaker.name}`}
+                                    aria-label={`删除人工新增说话人 ${speaker.name}`}
+                                  >
+                                    <Trash2 size={12} />
+                                  </button>
+                                )}
+                              </div>
+                            )
+                          })}
                         </div>
                         <div className="speaker-add-inline">
                           <input
