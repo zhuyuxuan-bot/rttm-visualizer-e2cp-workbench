@@ -649,6 +649,7 @@ const defaultCandidateFiles = {
   ...import.meta.glob('/exp/candidate/**/*.json', { eager: true, query: '?raw', import: 'default' }),
 } as Record<string, string>
 const WAVEFORM_HEIGHT = 148
+const WAVEFORM_VERTICAL_PADDING = 18
 const SUBTITLE_TRACK_HEIGHT = 48
 const WAVEFORM_POINTS_PER_SEC = 50
 const WAVEFORM_MAX_CHUNK_WIDTH = 3000
@@ -2564,6 +2565,7 @@ function AppContent(){
     if (!wavePeaks || waveformChunks.length === 0) return
     const dpr = (window.devicePixelRatio||1)
     const H = WAVEFORM_HEIGHT
+    const waveformAmplitude = Math.max(24, H - WAVEFORM_VERTICAL_PADDING * 2)
     const samples = wavePeaks?.length ?? 0
     let maxPeak = 0
     if (wavePeaks) {
@@ -2633,7 +2635,7 @@ function AppContent(){
       const idx = Math.min(samples-1, Math.max(0, Math.floor(t * WAVEFORM_POINTS_PER_SEC)))
       const amp = wavePeaks[idx] || 0
       const normalized = Math.min(1, amp / scalePeak)
-      const h = Math.max(1, normalized * (H-22))
+      const h = Math.max(1, normalized * waveformAmplitude)
       ctx.moveTo(x, mid - h/2)
       ctx.lineTo(x, mid + h/2)
     }
@@ -2940,7 +2942,7 @@ function AppContent(){
 
           {/* Timeline area with dynamic height */}
           <div className="timeline-wrap" style={{flex: '1 1 auto', minHeight: '200px', display:'flex', flexDirection:'column', padding: '0 12px'}}>
-            <div className={`timeline${missingPickMode !== 'idle' ? ' picking-time' : ''}`} style={{flex: '1 1 auto', minHeight: '200px'}} ref={waveRef} onClick={onClickTimeline}
+            <div className={`timeline${missingPickMode !== 'idle' ? ' picking-time' : ''}`} style={{flex: '1 1 auto', minHeight: timelineMinHeight}} ref={waveRef} onClick={onClickTimeline}
               onScroll={onTimelineScroll}
               onPointerDown={onTimelinePointerDown}
               onPointerMove={onTimelinePointerMove}
