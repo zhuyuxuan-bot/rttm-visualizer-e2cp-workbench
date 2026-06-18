@@ -49,6 +49,11 @@ export interface ReviewSegment {
   speaker_id: string
   speaker_name: string
   text: string
+  original?: {
+    speaker_id?: string
+    speaker_name?: string
+    text?: string
+  }
   segment_type: SegmentType
   review_status: ReviewStatus
   evidence: SegmentEvidence
@@ -112,6 +117,8 @@ export function buildEpisodeProject(input: {
     start: number
     end: number
     text?: string
+    originalSpeakerId?: string
+    originalText?: string
     reviewStatus?: ReviewStatus
     notes?: string
     segmentType?: SegmentType
@@ -128,6 +135,7 @@ export function buildEpisodeProject(input: {
     index: number,
   ): ReviewSegment => {
     const speaker = speakerById.get(segment.speakerId)
+    const originalSpeaker = segment.originalSpeakerId ? speakerById.get(segment.originalSpeakerId) : undefined
     const text = segment.text ?? segment.evidence?.text?.value ?? ''
     return {
       id: segment.id,
@@ -137,6 +145,13 @@ export function buildEpisodeProject(input: {
       speaker_id: segment.speakerId,
       speaker_name: speaker?.name ?? segment.speakerId,
       text,
+      original: segment.originalSpeakerId || segment.originalText !== undefined
+        ? {
+            speaker_id: segment.originalSpeakerId,
+            speaker_name: originalSpeaker?.name ?? segment.originalSpeakerId,
+            text: segment.originalText,
+          }
+        : undefined,
       segment_type: segment.segmentType ?? 'dialogue',
       review_status: segment.reviewStatus ?? 'pending',
       evidence: {

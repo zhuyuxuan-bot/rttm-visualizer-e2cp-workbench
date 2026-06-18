@@ -8,8 +8,11 @@ import {
   type MissingTimePickMode,
 } from './missingInsertSelection'
 import { sanitizeNonJsonNumericTokens } from './candidateJsonSanitizer'
+import { filterDialogueRows } from './dialogueFilters'
 import { stripSpeakerPrefix } from './dialogueText'
 import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
+import { getReviewPrimaryActionOrder, REVIEW_PRIMARY_ACTION_LABELS } from './reviewPanelActions'
+import { buildSegmentRevisionSummary, preserveOriginalSegmentFields } from './segmentAudit'
 import {
   episodeFileMatches,
   getEpisodeWorkPackage,
@@ -87,6 +90,8 @@ interface Segment {
   start: number
   end: number
   text?: string
+  originalSpeakerId?: string
+  originalText?: string
   reviewStatus?: ReviewStatus
   notes?: string
   segmentType?: SegmentType
@@ -236,12 +241,19 @@ function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
       const speakerId = pickString(record, ['speaker_id', 'speakerId', 'speaker']) || 'UNKNOWN'
       if (startMs === undefined || endMs === undefined) return acc
       const evidence = asRecord(record.evidence) as SegmentEvidence | null
+      const original = asRecord(record.original)
       acc.push({
         id: pickString(record, ['id']) || `project_${index + 1}_${startMs}_${endMs}`,
         speakerId,
         start: startMs / 1000,
         end: Math.max(startMs / 1000 + 0.001, endMs / 1000),
         text: pickString(record, ['text']) || evidence?.text?.value || '',
+        originalSpeakerId:
+          pickString(original || {}, ['speaker_id', 'speakerId']) ||
+          pickString(record, ['original_speaker_id', 'originalSpeakerId']),
+        originalText:
+          pickOptionalString(original, ['text']) ??
+          pickOptionalString(record, ['original_text', 'originalText']),
         reviewStatus: isReviewStatusValue(record.review_status) ? record.review_status : 'pending',
         segmentType: isSegmentTypeValue(record.segment_type) ? record.segment_type : 'dialogue',
         evidence: evidence || undefined,
@@ -506,6 +518,15 @@ function pickString(record: Record<string, unknown>, keys: string[]): string | u
   return undefined
 }
 
+function pickOptionalString(record: Record<string, unknown> | null, keys: string[]): string | undefined {
+  if (!record) return undefined
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
 function extractTimesFromKey(key: string): { start?: number; end?: number } {
   const keyMatch = key.match(/(?:^|_)(\d+(?:\.\d+)?)_(\d+(?:\.\d+)?)$/)
   if (keyMatch) {
@@ -723,6 +744,7 @@ function AppContent(){
   const [workMode, setWorkMode] = useState<WorkMode>('prepare')
   const [followPlayback, setFollowPlayback] = useState(true)
   const [quickSpeakerOpen, setQuickSpeakerOpen] = useState(false)
+  const [missingInsertOpen, setMissingInsertOpen] = useState(false)
   const [selectedEpisodeId, setSelectedEpisodeId] = useState(getInitialEpisodeId)
   const episodeManuallySelectedRef = useRef(false)
   const resourcePanelManuallyChangedRef = useRef(false)
@@ -739,6 +761,7 @@ function AppContent(){
   const [segmentTextDraft, setSegmentTextDraft] = useState('')
   const [segmentNotesDraft, setSegmentNotesDraft] = useState('')
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
+  const [segmentSpeakerFilter, setSegmentSpeakerFilter] = useState<string | 'all'>('all')
   const [packageNotice, setPackageNotice] = useState('')
   const [missingInsertDraft, setMissingInsertDraft] = useState({ start: '', end: '', text: '', speakerId: '' })
   const [missingPickMode, setMissingPickMode] = useState<MissingTimePickMode>('idle')
@@ -791,6 +814,14 @@ function AppContent(){
     () => Array.from(new Set(speakers.flatMap((speaker) => [speaker.name, speaker.id]).filter(Boolean))),
     [speakers],
   )
+  const allSubtitles = useMemo(() => {
+    return srt?.subtitles ?? []
+  }, [srt])
+  const getSegmentDisplayText = useCallback((segment: Segment): string => {
+    const subtitle = segment.text?.trim() ? null : findBestSubtitleForSegment(segment, allSubtitles)
+    const rawText = segment.text?.trim() || subtitle?.text || ''
+    return stripSpeakerPrefix(rawText, speakerTextLabels)
+  }, [allSubtitles, speakerTextLabels])
   const segmentsBySpeaker = useMemo(() => {
     const map = new Map<string, Segment[]>()
     for (const segment of segments) {
@@ -811,6 +842,11 @@ function AppContent(){
     setQuickSpeakerOpen(false)
   }, [selectedSegId])
   useEffect(() => {
+    if (segmentSpeakerFilter !== 'all' && !speakers.some((speaker) => speaker.id === segmentSpeakerFilter)) {
+      setSegmentSpeakerFilter('all')
+    }
+  }, [segmentSpeakerFilter, speakers])
+  useEffect(() => {
     if (!selectedSegment?.speakerId) return
     const track = trackRefs.current.get(selectedSegment.speakerId)
     track?.scrollIntoView({ block: 'nearest' })
@@ -828,12 +864,24 @@ function AppContent(){
     }
     return best?.entry ?? null
   }, [candidateFile, selectedSegment])
+  const selectedRevisionSummary = useMemo(() => {
+    if (!selectedSegment) return null
+    const originalSpeaker = selectedSegment.originalSpeakerId
+      ? speakers.find((speaker) => speaker.id === selectedSegment.originalSpeakerId)
+      : null
+    return buildSegmentRevisionSummary(selectedSegment, {
+      originalSpeakerName: originalSpeaker?.name || selectedSegment.originalSpeakerId,
+      currentSpeakerName: selectedSpeaker?.name || selectedSegment.speakerId,
+      currentText: getSegmentDisplayText(selectedSegment),
+    })
+  }, [getSegmentDisplayText, selectedSegment, selectedSpeaker?.name, speakers])
   const updateSelectedSegment = useCallback((patch: Partial<Segment>) => {
     if (!selectedSegId) return
     setSegments((prev) => prev.map((segment) => (
       segment.id === selectedSegId
         ? {
             ...segment,
+            ...preserveOriginalSegmentFields(segment, patch, getSegmentDisplayText(segment)),
             ...patch,
             evidence: patch.evidence
               ? { ...segment.evidence, ...patch.evidence }
@@ -841,12 +889,13 @@ function AppContent(){
           }
         : segment
     )))
-  }, [selectedSegId])
+  }, [getSegmentDisplayText, selectedSegId])
   const commitSegmentTextToSegment = useCallback((segmentId: string, value: string) => {
     setSegments((prev) => prev.map((segment) => (
       segment.id === segmentId
         ? {
             ...segment,
+            ...preserveOriginalSegmentFields(segment, { text: value }, getSegmentDisplayText(segment)),
             text: value,
             evidence: {
               ...segment.evidence,
@@ -856,7 +905,7 @@ function AppContent(){
           }
         : segment
     )))
-  }, [])
+  }, [getSegmentDisplayText])
   const commitSegmentNotesToSegment = useCallback((segmentId: string, value: string) => {
     setSegments((prev) => prev.map((segment) => (
       segment.id === segmentId
@@ -1300,17 +1349,16 @@ function AppContent(){
     return defaultTracks
   }, [speakers, defaultTracks])
 
-  const allSubtitles = useMemo(() => {
-    return srt?.subtitles ?? []
-  }, [srt])
   const sortedSegmentRows = useMemo(
     () => segments.slice().sort((a, b) => a.start - b.start).map((segment, index) => ({ segment, index })),
     [segments],
   )
   const filteredSegmentRows = useMemo(() => {
-    if (segmentStatusFilter === 'all') return sortedSegmentRows
-    return sortedSegmentRows.filter(({ segment }) => (segment.reviewStatus || 'pending') === segmentStatusFilter)
-  }, [segmentStatusFilter, sortedSegmentRows])
+    return filterDialogueRows(sortedSegmentRows, {
+      status: segmentStatusFilter,
+      speakerId: segmentSpeakerFilter,
+    })
+  }, [segmentSpeakerFilter, segmentStatusFilter, sortedSegmentRows])
   const dialogueRows = filteredSegmentRows
   const playbackSegmentRow = useMemo(
     () => sortedSegmentRows.find(({ segment }) => currentTime >= segment.start && currentTime < segment.end) ?? null,
@@ -3353,18 +3401,51 @@ function AppContent(){
                     <div className="badge-sm">文本和说话人都正确时，只点“通过检查”</div>
                   </div>
                   <div className="review-primary-actions">
-                    <button
-                      className="btn tiny"
-                      disabled={reviewProgress.counts.pending === 0}
-                      onClick={() => jumpToNextStatus('pending')}
-                    >
-                      下一条待处理
-                    </button>
-                    {selectedSegment && (
-                      <button className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
-                        通过检查
-                      </button>
-                    )}
+                    {getReviewPrimaryActionOrder(Boolean(selectedSegment)).map((action) => {
+                      if (action === 'nextPending') {
+                        return (
+                          <button
+                            key={action}
+                            className="btn tiny"
+                            disabled={reviewProgress.counts.pending === 0}
+                            onClick={() => jumpToNextStatus('pending')}
+                          >
+                            {REVIEW_PRIMARY_ACTION_LABELS.nextPending}
+                          </button>
+                        )
+                      }
+                      if (action === 'changeSpeaker') {
+                        return (
+                          <button
+                            key={action}
+                            type="button"
+                            className={`btn tiny speaker-action-btn${quickSpeakerOpen ? ' active' : ''}`}
+                            onClick={() => setQuickSpeakerOpen((open) => !open)}
+                            aria-expanded={quickSpeakerOpen}
+                          >
+                            {quickSpeakerOpen ? '收起说话人' : REVIEW_PRIMARY_ACTION_LABELS.changeSpeaker}
+                          </button>
+                        )
+                      }
+                      if (action === 'insertMissing') {
+                        return (
+                          <button
+                            key={action}
+                            type="button"
+                            className={`btn tiny missing-action-btn${missingInsertOpen ? ' active' : ''}`}
+                            onClick={() => setMissingInsertOpen((open) => !open)}
+                            aria-expanded={missingInsertOpen}
+                          >
+                            {missingInsertOpen ? '收起漏句' : REVIEW_PRIMARY_ACTION_LABELS.insertMissing}
+                          </button>
+                        )
+                      }
+                      return (
+                        <button key={action} className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
+                          {REVIEW_PRIMARY_ACTION_LABELS.pass}
+                        </button>
+                      )
+                    })}
                   </div>
                 </div>
                 {!selectedSegment ? (
@@ -3378,18 +3459,24 @@ function AppContent(){
                         {selectedSegment.reviewStatus || 'pending'}
                       </span>
                     </div>
-                    <div className={`quick-speaker-panel${quickSpeakerOpen ? ' open' : ''}`}>
-                        <button
-                          className="quick-panel-toggle"
-                          type="button"
-                          onClick={() => setQuickSpeakerOpen((open) => !open)}
-                        >
-                          <span>一键更改说话人</span>
-                          <span>{quickSpeakerOpen ? '收起' : '展开'}</span>
-                        </button>
-                        <div className="quick-panel-title">一键改说话人</div>
-                        {quickSpeakerOpen && (
-                          <>
+                    {selectedRevisionSummary && selectedRevisionSummary.badges.length > 0 && (
+                      <div className="revision-summary">
+                        <div className="revision-badges">
+                          {selectedRevisionSummary.badges.map((badge) => (
+                            <span key={badge}>{badge}</span>
+                          ))}
+                        </div>
+                        {selectedRevisionSummary.speakerLine && (
+                          <div>原说话人：{selectedRevisionSummary.speakerLine}</div>
+                        )}
+                        {selectedRevisionSummary.textLine && (
+                          <div>原台词：{selectedRevisionSummary.textLine}</div>
+                        )}
+                      </div>
+                    )}
+                    {quickSpeakerOpen && (
+                      <div className="quick-speaker-panel open">
+                        <div className="quick-panel-title">选择正确说话人</div>
                         <div className="quick-speaker-grid">
                           {speakers.length === 0 && (
                             <div className="badge-sm">暂无说话人，可在下方新增。</div>
@@ -3452,9 +3539,8 @@ function AppContent(){
                             添加并用于当前
                           </button>
                         </div>
-                          </>
-                        )}
                       </div>
+                    )}
                     <div className="editor-grid">
                       <label className="field">
                         <span>说话人</span>
@@ -3519,61 +3605,8 @@ function AppContent(){
                         />
                       </label>
                     </div>
-                    <details className="more-actions">
-                      <summary>更多操作：候选证据 / 漏句插入 / 备注</summary>
-                      <div className="candidate-panel">
-                        <div className="candidate-header">
-                          <span>候选匹配 JSON</span>
-                          <span className="badge-sm">{candidateFile?.name || '未加载 subseg_match_results.json'}</span>
-                        </div>
-                        {!candidateFile ? (
-                          <div className="badge-sm">加载候选 JSON 后，这里会显示 top_5_speakers / top_5_faces。</div>
-                        ) : !selectedCandidate ? (
-                          <div className="badge-sm">当前片段附近没有匹配到候选结果。</div>
-                        ) : (
-                          <>
-                            <div className="candidate-line">
-                              <span>{selectedCandidate.segmentKey}</span>
-                              <span>{selectedCandidate.start !== undefined ? formatHMSms(selectedCandidate.start) : '--'} - {selectedCandidate.end !== undefined ? formatHMSms(selectedCandidate.end) : '--'}</span>
-                            </div>
-                            {selectedCandidate.subtitleText && (
-                              <div className="candidate-text">{selectedCandidate.subtitleText}</div>
-                            )}
-                            <div className="candidate-pills">
-                              {selectedCandidate.top5Speakers.slice(0, 5).map((candidate, index) => {
-                                const role = candidate.role || candidate.speaker || `候选${index + 1}`
-                                return (
-                                  <button
-                                    key={`${role}-${index}`}
-                                    className="candidate-pill"
-                                    onClick={() => {
-                                      const existing = speakers.find((speaker) => speaker.id === role || speaker.name === role)
-                                      const speaker = existing || addSpeaker(role, 'candidate')
-                                      updateSelectedSegment({
-                                        speakerId: speaker.id,
-                                        reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
-                                        evidence: {
-                                          fusion: {
-                                            role: speaker.name,
-                                            strategy: 'candidate_top5_speaker',
-                                            confidence: candidate.score,
-                                          },
-                                        },
-                                      })
-                                    }}
-                                    title="点击后应用为当前片段说话人"
-                                  >
-                                    {role}{candidate.score !== undefined ? ` ${candidate.score.toFixed(3)}` : ''}
-                                  </button>
-                                )
-                              })}
-                              {selectedCandidate.top5Speakers.length === 0 && <span className="badge-sm">top_5_speakers 为空</span>}
-                            </div>
-                            <div className="badge-sm">top_5_faces: {selectedCandidate.top5Faces.length || '空'}</div>
-                          </>
-                        )}
-                      </div>
-                      <div className="missing-insert-card">
+                    {missingInsertOpen && (
+                      <div className="missing-insert-card quick-missing-card">
                         <div className="quick-panel-title">漏句插入向导</div>
                         <div className="missing-pick-toolbar">
                           <button
@@ -3662,6 +3695,91 @@ function AppContent(){
                           <button className="btn tiny pass-btn" onClick={insertMissingDraft}>插入漏句</button>
                         </div>
                       </div>
+                    )}
+                    <details className="more-actions">
+                      <summary>更多操作：候选证据 / 原始值恢复 / 备注</summary>
+                      <div className="candidate-panel">
+                        <div className="candidate-header">
+                          <span>候选匹配 JSON</span>
+                          <span className="badge-sm">{candidateFile?.name || '未加载 subseg_match_results.json'}</span>
+                        </div>
+                        {!candidateFile ? (
+                          <div className="badge-sm">加载候选 JSON 后，这里会显示 top_5_speakers / top_5_faces。</div>
+                        ) : !selectedCandidate ? (
+                          <div className="badge-sm">当前片段附近没有匹配到候选结果。</div>
+                        ) : (
+                          <>
+                            <div className="candidate-line">
+                              <span>{selectedCandidate.segmentKey}</span>
+                              <span>{selectedCandidate.start !== undefined ? formatHMSms(selectedCandidate.start) : '--'} - {selectedCandidate.end !== undefined ? formatHMSms(selectedCandidate.end) : '--'}</span>
+                            </div>
+                            {selectedCandidate.subtitleText && (
+                              <div className="candidate-text">{selectedCandidate.subtitleText}</div>
+                            )}
+                            <div className="candidate-pills">
+                              {selectedCandidate.top5Speakers.slice(0, 5).map((candidate, index) => {
+                                const role = candidate.role || candidate.speaker || `候选${index + 1}`
+                                return (
+                                  <button
+                                    key={`${role}-${index}`}
+                                    className="candidate-pill"
+                                    onClick={() => {
+                                      const existing = speakers.find((speaker) => speaker.id === role || speaker.name === role)
+                                      const speaker = existing || addSpeaker(role, 'candidate')
+                                      updateSelectedSegment({
+                                        speakerId: speaker.id,
+                                        reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+                                        evidence: {
+                                          fusion: {
+                                            role: speaker.name,
+                                            strategy: 'candidate_top5_speaker',
+                                            confidence: candidate.score,
+                                          },
+                                        },
+                                      })
+                                    }}
+                                    title="点击后应用为当前片段说话人"
+                                  >
+                                    {role}{candidate.score !== undefined ? ` ${candidate.score.toFixed(3)}` : ''}
+                                  </button>
+                                )
+                              })}
+                              {selectedCandidate.top5Speakers.length === 0 && <span className="badge-sm">top_5_speakers 为空</span>}
+                            </div>
+                            <div className="badge-sm">top_5_faces: {selectedCandidate.top5Faces.length || '空'}</div>
+                          </>
+                        )}
+                      </div>
+                      {selectedRevisionSummary && selectedRevisionSummary.badges.length > 0 && (
+                        <div className="restore-original-panel">
+                          <div className="quick-panel-title">原始值复核</div>
+                          <div className="badge-sm">用于复核误改；只在当前片段存在修改痕迹时显示。</div>
+                          <div className="row" style={{gap:8, flexWrap:'wrap'}}>
+                            {selectedRevisionSummary.hasSpeakerChanged && selectedSegment.originalSpeakerId && (
+                              <button
+                                className="btn tiny"
+                                onClick={() => updateSelectedSegment({
+                                  speakerId: selectedSegment.originalSpeakerId,
+                                  evidence: { fusion: { role: selectedSegment.originalSpeakerId, strategy: 'restore_original_speaker' } },
+                                })}
+                              >
+                                恢复原说话人
+                              </button>
+                            )}
+                            {selectedRevisionSummary.hasTextChanged && selectedSegment.originalText !== undefined && (
+                              <button
+                                className="btn tiny"
+                                onClick={() => {
+                                  setSegmentTextDraft(selectedSegment.originalText || '')
+                                  commitSegmentTextToSegment(selectedSegment.id, selectedSegment.originalText || '')
+                                }}
+                              >
+                                恢复原台词
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                       <label className="field">
                         <span>备注</span>
                         <textarea
@@ -3699,6 +3817,15 @@ function AppContent(){
                         <option value="uncertain">uncertain</option>
                         <option value="deleted">deleted</option>
                       </select>
+                      <select
+                        value={segmentSpeakerFilter}
+                        onChange={(event) => setSegmentSpeakerFilter(event.target.value)}
+                      >
+                        <option value="all">全部说话人</option>
+                        {speakers.map((speaker) => (
+                          <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                        ))}
+                      </select>
                       <button
                         className="btn tiny"
                         disabled={reviewProgress.counts.pending === 0}
@@ -3726,11 +3853,23 @@ function AppContent(){
                         const rowSubtitle = segment.text?.trim() ? null : findBestSubtitleForSegment(segment, allSubtitles)
                         const rowTextRaw = segment.text?.trim() || rowSubtitle?.text || '-'
                         const rowText = stripSpeakerPrefix(rowTextRaw, speakerTextLabels)
+                        const originalSpeaker = segment.originalSpeakerId
+                          ? speakers.find((item) => item.id === segment.originalSpeakerId)
+                          : null
+                        const revision = buildSegmentRevisionSummary(segment, {
+                          originalSpeakerName: originalSpeaker?.name || segment.originalSpeakerId,
+                          currentSpeakerName: speaker?.name || segment.speakerId,
+                          currentText: rowText,
+                        })
                         return (
                           <button
                             key={segment.id}
                             className={`segment-row dialogue-row status-${status}${isPlayback ? ' playing' : ''}${isSelected ? ' current' : ''}`}
-                            title={rowText}
+                            title={[
+                              rowText,
+                              revision.speakerLine ? `原说话人：${revision.speakerLine}` : '',
+                              revision.textLine ? `原台词：${revision.textLine}` : '',
+                            ].filter(Boolean).join('\n')}
                             onClick={() => {
                               setFollowPlayback(true)
                               setSelectedSegId(segment.id)
@@ -3744,7 +3883,12 @@ function AppContent(){
                               <strong>{speaker?.name || segment.speakerId}</strong>
                               <small>ID: {segment.speakerId}</small>
                             </span>
-                            <span>{status}</span>
+                            <span className="dialogue-status-cell">
+                              <span>{status}</span>
+                              {revision.badges.length > 0 && (
+                                <small>{revision.badges.join(' / ')}</small>
+                              )}
+                            </span>
                             <span className="dialogue-text">{rowText}</span>
                           </button>
                         )
