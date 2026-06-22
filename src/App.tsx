@@ -9,10 +9,12 @@ import {
 } from './missingInsertSelection'
 import { sanitizeNonJsonNumericTokens } from './candidateJsonSanitizer'
 import { filterDialogueRows } from './dialogueFilters'
+import { getFilteredPlaybackStep } from './filteredPlaybackQueue'
 import { stripSpeakerPrefix } from './dialogueText'
 import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
 import { getReviewPrimaryActionOrder, REVIEW_PRIMARY_ACTION_LABELS } from './reviewPanelActions'
 import { buildSegmentRevisionSummary, preserveOriginalSegmentFields } from './segmentAudit'
+import { getReviewStatusAfterSegmentPatch } from './segmentReviewStatus'
 import {
   episodeFileMatches,
   getEpisodeWorkPackage,
@@ -883,6 +885,7 @@ function AppContent(){
             ...segment,
             ...preserveOriginalSegmentFields(segment, patch, getSegmentDisplayText(segment)),
             ...patch,
+            reviewStatus: getReviewStatusAfterSegmentPatch(segment, patch),
             evidence: patch.evidence
               ? { ...segment.evidence, ...patch.evidence }
               : segment.evidence,
@@ -1359,6 +1362,15 @@ function AppContent(){
       speakerId: segmentSpeakerFilter,
     })
   }, [segmentSpeakerFilter, segmentStatusFilter, sortedSegmentRows])
+  const filteredPlaybackQueue = useMemo(() => {
+    if (segmentSpeakerFilter === 'all') return []
+    return filteredSegmentRows.map(({ segment }) => ({
+      id: segment.id,
+      start: segment.start,
+      end: segment.end,
+    }))
+  }, [filteredSegmentRows, segmentSpeakerFilter])
+  const filteredPlaybackMode = segmentSpeakerFilter !== 'all'
   const dialogueRows = filteredSegmentRows
   const playbackSegmentRow = useMemo(
     () => sortedSegmentRows.find(({ segment }) => currentTime >= segment.start && currentTime < segment.end) ?? null,
@@ -1599,7 +1611,30 @@ function AppContent(){
   const togglePlay = () => {
     const el = videoRef.current
     if(!el) return
-    if(el.paused){ setFollowPlayback(true); el.play(); el.playbackRate = playbackRate; setIsPlaying(true) } else { el.pause(); setIsPlaying(false) }
+    if(el.paused){
+      setFollowPlayback(true)
+      if (filteredPlaybackMode) {
+        const step = getFilteredPlaybackStep(filteredPlaybackQueue, el.currentTime, { wrapToFirst: true })
+        if (step.type === 'pause') {
+          setToast({ message: '当前筛选条件下没有可播放片段' })
+          window.setTimeout(() => setToast(null), 2600)
+          return
+        }
+        if (step.type === 'seek') {
+          el.currentTime = step.time
+          setCurrentTime(step.time)
+          setSelectedSegId(step.segmentId)
+        } else if (step.segmentId) {
+          setSelectedSegId(step.segmentId)
+        }
+      }
+      el.playbackRate = playbackRate
+      void el.play().catch(() => setIsPlaying(false))
+      setIsPlaying(true)
+    } else {
+      el.pause()
+      setIsPlaying(false)
+    }
   }
   const seek = (t:number) => {
     const el = videoRef.current; if(!el) return
@@ -1649,8 +1684,28 @@ function AppContent(){
   }
   const onTimeUpdate = () => {
     const el = videoRef.current; if(!el) return
-    setCurrentTime(el.currentTime)
     if(el.duration && el.duration !== duration) setDuration(el.duration)
+    const nextTime = el.currentTime
+    if (isPlaying && filteredPlaybackMode) {
+      const step = getFilteredPlaybackStep(filteredPlaybackQueue, nextTime)
+      if (step.type === 'seek') {
+        el.currentTime = step.time
+        setCurrentTime(step.time)
+        setSelectedSegId(step.segmentId)
+        return
+      }
+      if (step.type === 'pause') {
+        el.pause()
+        setIsPlaying(false)
+        setCurrentTime(nextTime)
+        return
+      }
+      if (step.segmentId) {
+        const activeSegmentId = step.segmentId
+        setSelectedSegId((current) => current === activeSegmentId ? current : activeSegmentId)
+      }
+    }
+    setCurrentTime(nextTime)
   }
   const onLoadedMetadata = () => {
     const el = videoRef.current; if(!el) return
