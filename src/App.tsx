@@ -674,6 +674,9 @@ const defaultCandidateFiles = {
 const WAVEFORM_HEIGHT = 148
 const WAVEFORM_VERTICAL_PADDING = 18
 const SUBTITLE_TRACK_HEIGHT = 48
+const TIMELINE_RULER_HEIGHT = 24
+const SPEAKER_TRACK_HEIGHT = 28
+const MAX_VISIBLE_SPEAKER_TRACKS = 7
 const WAVEFORM_POINTS_PER_SEC = 50
 const WAVEFORM_MAX_CHUNK_WIDTH = 3000
 
@@ -790,6 +793,7 @@ function AppContent(){
   const segmentsRef = useRef<Segment[]>([])
   const speakersRef = useRef<Speaker[]>([])
   const trackRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const speakerTracksViewportRef = useRef<HTMLDivElement>(null)
   const dialogueListRef = useRef<HTMLDivElement>(null)
   const [dialogueScrollTop, setDialogueScrollTop] = useState(0)
   const [dialogueViewportHeight, setDialogueViewportHeight] = useState(480)
@@ -850,8 +854,22 @@ function AppContent(){
   }, [segmentSpeakerFilter, speakers])
   useEffect(() => {
     if (!selectedSegment?.speakerId) return
+    const viewport = speakerTracksViewportRef.current
     const track = trackRefs.current.get(selectedSegment.speakerId)
-    track?.scrollIntoView({ block: 'nearest' })
+    if (!viewport || !track) return
+
+    const frame = window.requestAnimationFrame(() => {
+      const viewportRect = viewport.getBoundingClientRect()
+      const trackRect = track.getBoundingClientRect()
+
+      if (trackRect.top < viewportRect.top) {
+        viewport.scrollTop -= viewportRect.top - trackRect.top
+      } else if (trackRect.bottom > viewportRect.bottom) {
+        viewport.scrollTop += trackRect.bottom - viewportRect.bottom
+      }
+    })
+
+    return () => window.cancelAnimationFrame(frame)
   }, [selectedSegment?.speakerId, speakers.length])
   const selectedCandidate = useMemo(() => {
     if (!selectedSegment || !candidateFile?.entries.length) return null
@@ -1912,7 +1930,13 @@ function AppContent(){
   const hasRefTrackVisible = showRefTrack && refSegments.length > 0
   const actualTrackCount = trackCount + (hasRefTrackVisible ? 1 : 0)
   const subtitleTrackHeight = hasSRT ? SUBTITLE_TRACK_HEIGHT : 0
-  const timelineMinHeight = 24 + WAVEFORM_HEIGHT + subtitleTrackHeight + Math.max(2, actualTrackCount) * 28 // ruler + wave + subtitles + tracks
+  const visibleSpeakerTrackCount = Math.min(
+    MAX_VISIBLE_SPEAKER_TRACKS,
+    Math.max(2, actualTrackCount),
+  )
+  const speakerTrackViewportHeight = visibleSpeakerTrackCount * SPEAKER_TRACK_HEIGHT
+  const timelineContentHeight =
+    TIMELINE_RULER_HEIGHT + WAVEFORM_HEIGHT + subtitleTrackHeight + speakerTrackViewportHeight
 
   // click timeline seek / missing-dialogue time picking
   const waveRef = useRef<HTMLDivElement>(null)
@@ -3045,7 +3069,7 @@ function AppContent(){
 
           {/* Timeline area with dynamic height */}
           <div className="timeline-wrap" style={{flex: '1 1 auto', minHeight: '200px', display:'flex', flexDirection:'column', padding: '0 12px'}}>
-            <div className={`timeline${missingPickMode !== 'idle' ? ' picking-time' : ''}`} style={{flex: '1 1 auto', minHeight: timelineMinHeight}} ref={waveRef} onClick={onClickTimeline}
+            <div className={`timeline${missingPickMode !== 'idle' ? ' picking-time' : ''}`} style={{flex: '0 0 auto', height: timelineContentHeight}} ref={waveRef} onClick={onClickTimeline}
               onScroll={onTimelineScroll}
               onPointerDown={onTimelinePointerDown}
               onPointerMove={onTimelinePointerMove}
@@ -3175,18 +3199,20 @@ function AppContent(){
               <div className="tracks" style={{ 
                 width: '100%', 
                 minWidth: timelineWidth, 
-                flex: '1 1 auto', 
+                flex: '0 0 auto',
+                height: speakerTrackViewportHeight,
                 display: 'flex', 
                 flexDirection: 'column',
                 position: 'relative' // 用于 DER overlay 定位
               }}>
                 {/* 可滚动的轨道容器 */}
                 <div
+                  ref={speakerTracksViewportRef}
                   style={{
                     flex: 'none',
+                    height: '100%',
                     overflowY: 'auto',
                     paddingRight: '8px',
-                    maxHeight: '40vh',
                   }}
                 >
                   {allTracks.map(spk => {
@@ -3205,7 +3231,7 @@ function AppContent(){
                         style={{
                           width: '100%',
                           minWidth: timelineWidth,
-                          height: 28,
+                          height: SPEAKER_TRACK_HEIGHT,
                           background: '#121624',
                           border: '1px solid #20263a',
                           borderTop: 'none',
@@ -3349,7 +3375,7 @@ function AppContent(){
                       style={{
                         width: '100%',
                         minWidth: timelineWidth,
-                        height: 28,
+                        height: SPEAKER_TRACK_HEIGHT,
                         background: '#0f121b',
                         border: '1px solid #20263a',
                         borderTop: 'none',
