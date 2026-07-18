@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { getFilteredPlaybackStep } from '../src/filteredPlaybackQueue.ts'
+import {
+  getFilteredPlaybackSessionAfterSeek,
+  getFilteredPlaybackStep,
+} from '../src/filteredPlaybackQueue.ts'
 
 const queue = [
   { id: 'a-1', start: 10, end: 12 },
@@ -26,4 +29,15 @@ test('filtered playback can wrap to the first queued segment when starting playb
     time: 10,
     segmentId: 'a-1',
   })
+})
+
+test('manual timeline seek releases filtered playback control', () => {
+  assert.equal(getFilteredPlaybackSessionAfterSeek(true), false)
+})
+
+test('dialogue-row seek can preserve filtered speaker playback', () => {
+  assert.equal(
+    getFilteredPlaybackSessionAfterSeek(true, { preserveFilteredPlayback: true }),
+    true,
+  )
 })

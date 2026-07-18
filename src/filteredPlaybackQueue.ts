@@ -9,6 +9,13 @@ export type PlaybackQueueStep =
   | { type: 'seek'; time: number; segmentId: string }
   | { type: 'pause' }
 
+export function getFilteredPlaybackSessionAfterSeek(
+  isSessionActive: boolean,
+  options: { preserveFilteredPlayback?: boolean } = {},
+): boolean {
+  return options.preserveFilteredPlayback === true && isSessionActive
+}
+
 export function getFilteredPlaybackStep(
   queue: PlaybackQueueSegment[],
   currentTime: number,

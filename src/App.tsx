@@ -9,7 +9,7 @@ import {
 } from './missingInsertSelection'
 import { sanitizeNonJsonNumericTokens } from './candidateJsonSanitizer'
 import { filterDialogueRows } from './dialogueFilters'
-import { getFilteredPlaybackStep } from './filteredPlaybackQueue'
+import { getFilteredPlaybackSessionAfterSeek, getFilteredPlaybackStep } from './filteredPlaybackQueue'
 import { stripSpeakerPrefix } from './dialogueText'
 import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
 import { getReviewPrimaryActionOrder, REVIEW_PRIMARY_ACTION_LABELS } from './reviewPanelActions'
@@ -768,6 +768,7 @@ function AppContent(){
   const [segmentNotesDraft, setSegmentNotesDraft] = useState('')
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [segmentSpeakerFilter, setSegmentSpeakerFilter] = useState<string | 'all'>('all')
+  const filteredPlaybackSessionRef = useRef(false)
   const [packageNotice, setPackageNotice] = useState('')
   const [missingInsertDraft, setMissingInsertDraft] = useState({ start: '', end: '', text: '', speakerId: '' })
   const [missingPickMode, setMissingPickMode] = useState<MissingTimePickMode>('idle')
@@ -1402,6 +1403,9 @@ function AppContent(){
     }))
   }, [filteredSegmentRows, segmentSpeakerFilter])
   const filteredPlaybackMode = segmentSpeakerFilter !== 'all'
+  useEffect(() => {
+    filteredPlaybackSessionRef.current = filteredPlaybackMode
+  }, [filteredPlaybackMode, segmentSpeakerFilter])
   const dialogueRows = filteredSegmentRows
   const playbackSegmentRow = useMemo(
     () => sortedSegmentRows.find(({ segment }) => currentTime >= segment.start && currentTime < segment.end) ?? null,
@@ -1644,7 +1648,7 @@ function AppContent(){
     if(!el) return
     if(el.paused){
       setFollowPlayback(true)
-      if (filteredPlaybackMode) {
+      if (filteredPlaybackMode && filteredPlaybackSessionRef.current) {
         const step = getFilteredPlaybackStep(filteredPlaybackQueue, el.currentTime, { wrapToFirst: true })
         if (step.type === 'pause') {
           setToast({ message: '当前筛选条件下没有可播放片段' })
@@ -1667,8 +1671,12 @@ function AppContent(){
       setIsPlaying(false)
     }
   }
-  const seek = (t:number) => {
+  const seek = (t:number, options: { preserveFilteredPlayback?: boolean } = {}) => {
     const el = videoRef.current; if(!el) return
+    filteredPlaybackSessionRef.current = getFilteredPlaybackSessionAfterSeek(
+      filteredPlaybackSessionRef.current,
+      options,
+    )
     const nextTime = Math.max(0, Math.min(t, duration||el.duration||0))
     el.currentTime = nextTime
     setCurrentTime(nextTime)
@@ -1717,7 +1725,7 @@ function AppContent(){
     const el = videoRef.current; if(!el) return
     if(el.duration && el.duration !== duration) setDuration(el.duration)
     const nextTime = el.currentTime
-    if (isPlaying && filteredPlaybackMode) {
+    if (isPlaying && filteredPlaybackMode && filteredPlaybackSessionRef.current) {
       const step = getFilteredPlaybackStep(filteredPlaybackQueue, nextTime)
       if (step.type === 'seek') {
         el.currentTime = step.time
@@ -3969,16 +3977,18 @@ function AppContent(){
                             ].filter(Boolean).join('\n')}
                             onClick={() => {
                               setFollowPlayback(true)
+                              filteredPlaybackSessionRef.current = filteredPlaybackMode
                               setSelectedSegId(segment.id)
-                              seek(segment.start)
+                              seek(segment.start, { preserveFilteredPlayback: true })
                             }}
                             onKeyDown={(event) => {
                               if (event.target !== event.currentTarget) return
                               if (event.key !== 'Enter' && event.key !== ' ') return
                               event.preventDefault()
                               setFollowPlayback(true)
+                              filteredPlaybackSessionRef.current = filteredPlaybackMode
                               setSelectedSegId(segment.id)
-                              seek(segment.start)
+                              seek(segment.start, { preserveFilteredPlayback: true })
                             }}
                           >
                             <span>{index + 1}</span>
