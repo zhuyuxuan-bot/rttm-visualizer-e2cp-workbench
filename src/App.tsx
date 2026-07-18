@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Play, Pause, SkipBack, SkipForward, ZoomIn, ZoomOut, Upload, Download, Github, Plus, Trash2 } from 'lucide-react'
+import { Check, Download, Github, Pause, Pencil, Play, Plus, SkipBack, SkipForward, Trash2, Upload, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { computeDER, type ErrorInterval, type DERMetrics } from './utils'
 import { buildEpisodeProject, type ReviewStatus, type SegmentEvidence, type SegmentType } from './reviewSchema'
 import {
@@ -764,6 +764,7 @@ function AppContent(){
   const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
   const [newSpeakerName, setNewSpeakerName] = useState('')
   const [segmentTextDraft, setSegmentTextDraft] = useState('')
+  const [inlineTextEdit, setInlineTextEdit] = useState<{ segmentId: string; value: string } | null>(null)
   const [segmentNotesDraft, setSegmentNotesDraft] = useState('')
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [segmentSpeakerFilter, setSegmentSpeakerFilter] = useState<string | 'all'>('all')
@@ -912,21 +913,33 @@ function AppContent(){
     )))
   }, [getSegmentDisplayText, selectedSegId])
   const commitSegmentTextToSegment = useCallback((segmentId: string, value: string) => {
+    const nextValue = value.trim()
     setSegments((prev) => prev.map((segment) => (
       segment.id === segmentId
-        ? {
-            ...segment,
-            ...preserveOriginalSegmentFields(segment, { text: value }, getSegmentDisplayText(segment)),
-            text: value,
-            evidence: {
-              ...segment.evidence,
-              text: { source: 'manual', value },
-            },
-            reviewStatus: segment.reviewStatus === 'pending' ? 'corrected' : segment.reviewStatus,
-          }
+        ? (() => {
+            const currentText = getSegmentDisplayText(segment).trim()
+            if (nextValue === currentText) return segment
+            return {
+              ...segment,
+              ...preserveOriginalSegmentFields(segment, { text: nextValue }, currentText),
+              text: nextValue,
+              evidence: {
+                ...segment.evidence,
+                text: { source: 'manual' as const, value: nextValue },
+              },
+              reviewStatus: getReviewStatusAfterSegmentPatch(
+                { ...segment, text: currentText },
+                { text: nextValue },
+              ),
+            }
+          })()
         : segment
     )))
   }, [getSegmentDisplayText])
+  const commitInlineTextEdit = useCallback((segmentId: string, value: string) => {
+    commitSegmentTextToSegment(segmentId, value)
+    setInlineTextEdit((current) => current?.segmentId === segmentId ? null : current)
+  }, [commitSegmentTextToSegment])
   const commitSegmentNotesToSegment = useCallback((segmentId: string, value: string) => {
     setSegments((prev) => prev.map((segment) => (
       segment.id === segmentId
@@ -991,9 +1004,9 @@ function AppContent(){
     if (pending) commitSegmentNotesToSegment(pending.segmentId, pending.value)
   }, [commitSegmentNotesToSegment])
   useEffect(() => {
-    setSegmentTextDraft(selectedSegment?.text || '')
+    setSegmentTextDraft(selectedSegment ? getSegmentDisplayText(selectedSegment) : '')
     setSegmentNotesDraft(selectedSegment?.notes || '')
-  }, [selectedSegment?.id, selectedSegment?.notes, selectedSegment?.text])
+  }, [getSegmentDisplayText, selectedSegment?.id, selectedSegment?.notes, selectedSegment?.text])
   const addSpeaker = useCallback((name?: string, source: Speaker['source'] = 'manual') => {
     const trimmed = (name || newSpeakerName || '').trim()
     const baseName = trimmed || `speaker${speakers.length + 1}`
@@ -3942,9 +3955,12 @@ function AppContent(){
                           currentSpeakerName: speaker?.name || segment.speakerId,
                           currentText: rowText,
                         })
+                        const isEditingText = inlineTextEdit?.segmentId === segment.id
                         return (
-                          <button
+                          <div
                             key={segment.id}
+                            role="button"
+                            tabIndex={0}
                             className={`segment-row dialogue-row status-${status}${isPlayback ? ' playing' : ''}${isSelected ? ' current' : ''}`}
                             title={[
                               rowText,
@@ -3952,6 +3968,14 @@ function AppContent(){
                               revision.textLine ? `原台词：${revision.textLine}` : '',
                             ].filter(Boolean).join('\n')}
                             onClick={() => {
+                              setFollowPlayback(true)
+                              setSelectedSegId(segment.id)
+                              seek(segment.start)
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.target !== event.currentTarget) return
+                              if (event.key !== 'Enter' && event.key !== ' ') return
+                              event.preventDefault()
                               setFollowPlayback(true)
                               setSelectedSegId(segment.id)
                               seek(segment.start)
@@ -3970,8 +3994,84 @@ function AppContent(){
                                 <small>{revision.badges.join(' / ')}</small>
                               )}
                             </span>
-                            <span className="dialogue-text">{rowText}</span>
-                          </button>
+                            <div className={`dialogue-text-cell${revision.hasTextChanged ? ' has-original' : ''}`}>
+                              {isEditingText ? (
+                                <div
+                                  className="dialogue-inline-editor"
+                                  onClick={(event) => event.stopPropagation()}
+                                  onBlur={(event) => {
+                                    const nextFocus = event.relatedTarget
+                                    if (nextFocus instanceof Node && event.currentTarget.contains(nextFocus)) return
+                                    commitInlineTextEdit(segment.id, inlineTextEdit.value)
+                                  }}
+                                >
+                                  <textarea
+                                    autoFocus
+                                    rows={2}
+                                    aria-label={`编辑第 ${index + 1} 句台词`}
+                                    value={inlineTextEdit.value}
+                                    onChange={(event) => setInlineTextEdit({ segmentId: segment.id, value: event.target.value })}
+                                    onKeyDown={(event) => {
+                                      if (event.nativeEvent.isComposing) return
+                                      if (event.key === 'Escape') {
+                                        event.preventDefault()
+                                        setInlineTextEdit(null)
+                                      } else if (event.key === 'Enter' && !event.shiftKey) {
+                                        event.preventDefault()
+                                        commitInlineTextEdit(segment.id, inlineTextEdit.value)
+                                      }
+                                    }}
+                                  />
+                                  <div className="dialogue-inline-actions">
+                                    <button
+                                      type="button"
+                                      aria-label="保存台词修改"
+                                      title="保存（Enter）"
+                                      onMouseDown={(event) => event.preventDefault()}
+                                      onClick={() => commitInlineTextEdit(segment.id, inlineTextEdit.value)}
+                                    >
+                                      <Check size={14} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      aria-label="取消台词修改"
+                                      title="取消（Esc）"
+                                      onMouseDown={(event) => event.preventDefault()}
+                                      onClick={() => setInlineTextEdit(null)}
+                                    >
+                                      <X size={14} />
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="dialogue-text-edit-trigger"
+                                    title="点击直接修改台词"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      setFollowPlayback(false)
+                                      setSelectedSegId(segment.id)
+                                      seek(segment.start)
+                                      setInlineTextEdit({
+                                        segmentId: segment.id,
+                                        value: rowText === '-' ? '' : rowText,
+                                      })
+                                    }}
+                                  >
+                                    <span className="dialogue-text">{rowText}</span>
+                                    <Pencil size={13} className="dialogue-edit-icon" />
+                                  </button>
+                                  {revision.hasTextChanged && (
+                                    <small className="dialogue-original-text" title={segment.originalText || '（空）'}>
+                                      原：{segment.originalText || '（空）'}
+                                    </small>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          </div>
                         )
                       })}
                       {virtualDialogueRows.bottomPadding > 0 && (

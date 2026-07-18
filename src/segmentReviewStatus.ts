@@ -2,6 +2,7 @@ export type SegmentReviewStatus = 'pending' | 'checked' | 'corrected' | 'uncerta
 
 export interface ReviewStatusSegment {
   speakerId: string
+  text?: string
   reviewStatus?: SegmentReviewStatus
 }
 
@@ -16,6 +17,7 @@ export function getReviewStatusAfterSegmentPatch(
   patch: ReviewStatusPatch,
 ): SegmentReviewStatus {
   const speakerChanged = patch.speakerId !== undefined && patch.speakerId !== segment.speakerId
-  if (speakerChanged) return 'corrected'
+  const textChanged = patch.text !== undefined && patch.text !== (segment.text ?? '')
+  if (speakerChanged || textChanged) return 'corrected'
   return patch.reviewStatus ?? segment.reviewStatus ?? 'pending'
 }

@@ -12,11 +12,21 @@ test('changing speaker automatically marks a checked segment as corrected', () =
   )
 })
 
-test('non-speaker edits keep the existing review status', () => {
+test('changing text automatically marks a checked segment as corrected', () => {
   assert.equal(
     getReviewStatusAfterSegmentPatch(
-      { speakerId: 'speaker-a', reviewStatus: 'checked' },
+      { speakerId: 'speaker-a', text: '原台词', reviewStatus: 'checked' },
       { text: '修正台词' },
+    ),
+    'corrected',
+  )
+})
+
+test('saving unchanged text keeps the existing review status', () => {
+  assert.equal(
+    getReviewStatusAfterSegmentPatch(
+      { speakerId: 'speaker-a', text: '原台词', reviewStatus: 'checked' },
+      { text: '原台词' },
     ),
     'checked',
   )
