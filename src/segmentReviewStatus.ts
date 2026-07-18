@@ -21,3 +21,10 @@ export function getReviewStatusAfterSegmentPatch(
   if (speakerChanged || textChanged) return 'corrected'
   return patch.reviewStatus ?? segment.reviewStatus ?? 'pending'
 }
+
+export function getReviewStatusAfterPass(
+  status: SegmentReviewStatus | undefined,
+): SegmentReviewStatus {
+  const currentStatus = status ?? 'pending'
+  return currentStatus === 'pending' ? 'checked' : currentStatus
+}

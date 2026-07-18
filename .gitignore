@@ -12,6 +12,7 @@ node_modules/.vite/
 # Lint/Tooling caches
 /.cache/
 /.eslintcache
+/.playwright-cli/
 
 # Coverage
 /coverage/

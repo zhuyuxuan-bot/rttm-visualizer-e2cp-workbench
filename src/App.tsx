@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Check, Download, Github, Pause, Pencil, Play, Plus, SkipBack, SkipForward, Trash2, Upload, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Check, Download, Github, Pause, Pencil, Play, Plus, Search, SkipBack, SkipForward, Trash2, Upload, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { computeDER, type ErrorInterval, type DERMetrics } from './utils'
 import { buildEpisodeProject, type ReviewStatus, type SegmentEvidence, type SegmentType } from './reviewSchema'
 import {
@@ -12,9 +12,22 @@ import { filterDialogueRows } from './dialogueFilters'
 import { getFilteredPlaybackSessionAfterSeek, getFilteredPlaybackStep } from './filteredPlaybackQueue'
 import { stripSpeakerPrefix } from './dialogueText'
 import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
-import { getReviewPrimaryActionOrder, REVIEW_PRIMARY_ACTION_LABELS } from './reviewPanelActions'
 import { buildSegmentRevisionSummary, preserveOriginalSegmentFields } from './segmentAudit'
-import { getReviewStatusAfterSegmentPatch } from './segmentReviewStatus'
+import { getReviewStatusAfterPass, getReviewStatusAfterSegmentPatch } from './segmentReviewStatus'
+import { getSpeakerPickerPosition, orderSpeakerPickerOptions, updateRecentSpeakerIds } from './speakerPicker'
+import { ReviewWorkbench, type ReviewActionRequest, type ReviewDisplaySegment } from './ReviewWorkbench'
+import {
+  activateReviewRound,
+  appendReviewEvent,
+  buildReviewPackage,
+  createReviewWorkspace,
+  ensureReviewSegments,
+  getLatestReviewEvent,
+  parseReviewPackage,
+  summarizeReviewWorkspace,
+  type ReviewEvent,
+  type ReviewWorkspace,
+} from './reviewWorkflow'
 import {
   episodeFileMatches,
   getEpisodeWorkPackage,
@@ -163,7 +176,7 @@ const LAST_EPISODE_STORAGE_KEY = 'e2cp-rttm-workbench-last-episode'
 const MAX_HISTORY_STEPS = 80
 const DIALOGUE_ROW_HEIGHT = 76
 const DIALOGUE_OVERSCAN_ROWS = 12
-type WorkMode = 'prepare' | 'annotate'
+type WorkMode = 'prepare' | 'annotate' | 'inspect'
 
 function cloneSegments(segments: Segment[]): Segment[] {
   return segments.map((segment) => ({
@@ -748,9 +761,13 @@ function AppContent(){
   const [rightCollapsed, setRightCollapsed] = useState(false)
   const [workMode, setWorkMode] = useState<WorkMode>('prepare')
   const [followPlayback, setFollowPlayback] = useState(true)
-  const [quickSpeakerOpen, setQuickSpeakerOpen] = useState(false)
   const [missingInsertOpen, setMissingInsertOpen] = useState(false)
   const [selectedEpisodeId, setSelectedEpisodeId] = useState(getInitialEpisodeId)
+  const [reviewerName, setReviewerName] = useState(() => {
+    try { return window.localStorage.getItem('e2cp-reviewer-name') || '李明' } catch { return '李明' }
+  })
+  const [reviewRoundNumber, setReviewRoundNumber] = useState(1)
+  const [reviewWorkspace, setReviewWorkspace] = useState<ReviewWorkspace | null>(null)
   const episodeManuallySelectedRef = useRef(false)
   const resourcePanelManuallyChangedRef = useRef(false)
   const hasAutoEnteredAnnotationRef = useRef(false)
@@ -762,9 +779,16 @@ function AppContent(){
   const bootDraftCheckedRef = useRef(false)
   const bootDraftRestoredRef = useRef(false)
   const [selectedSegId, setSelectedSegId] = useState<string|null>(null)
-  const [newSpeakerName, setNewSpeakerName] = useState('')
   const [segmentTextDraft, setSegmentTextDraft] = useState('')
   const [inlineTextEdit, setInlineTextEdit] = useState<{ segmentId: string; value: string } | null>(null)
+  const [inlineSpeakerPicker, setInlineSpeakerPicker] = useState<{
+    segmentId: string
+    mode: 'assign' | 'add'
+    query: string
+    x: number
+    y: number
+  } | null>(null)
+  const [recentSpeakerIds, setRecentSpeakerIds] = useState<string[]>([])
   const [segmentNotesDraft, setSegmentNotesDraft] = useState('')
   const [segmentStatusFilter, setSegmentStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [segmentSpeakerFilter, setSegmentSpeakerFilter] = useState<string | 'all'>('all')
@@ -797,6 +821,7 @@ function AppContent(){
   const trackRefs = useRef<Map<string, HTMLDivElement>>(new Map())
   const speakerTracksViewportRef = useRef<HTMLDivElement>(null)
   const dialogueListRef = useRef<HTMLDivElement>(null)
+  const inlineSpeakerPickerRef = useRef<HTMLDivElement>(null)
   const [dialogueScrollTop, setDialogueScrollTop] = useState(0)
   const [dialogueViewportHeight, setDialogueViewportHeight] = useState(480)
   const autoDialogueScrollingRef = useRef(false)
@@ -810,6 +835,14 @@ function AppContent(){
   const selectedSpeaker = useMemo(
     () => speakers.find((speaker) => speaker.id === selectedSegment?.speakerId) ?? null,
     [speakers, selectedSegment?.speakerId],
+  )
+  const inlineSpeakerPickerSegment = useMemo(
+    () => segments.find((segment) => segment.id === inlineSpeakerPicker?.segmentId) ?? null,
+    [inlineSpeakerPicker?.segmentId, segments],
+  )
+  const inlineSpeakerPickerOptions = useMemo(
+    () => orderSpeakerPickerOptions(speakers, recentSpeakerIds, inlineSpeakerPicker?.query || ''),
+    [inlineSpeakerPicker?.query, recentSpeakerIds, speakers],
   )
   const episodePackage = useMemo(
     () => getEpisodeWorkPackage(selectedEpisodeId),
@@ -830,6 +863,25 @@ function AppContent(){
     const rawText = segment.text?.trim() || subtitle?.text || ''
     return stripSpeakerPrefix(rawText, speakerTextLabels)
   }, [allSubtitles, speakerTextLabels])
+  const reviewDisplaySegments = useMemo<ReviewDisplaySegment[]>(() => {
+    const speakerById = new Map(speakers.map((speaker) => [speaker.id, speaker]))
+    return segments
+      .slice()
+      .sort((left, right) => left.start - right.start)
+      .map((segment, index) => {
+        const speaker = speakerById.get(segment.speakerId)
+        return {
+          id: segment.id,
+          index: index + 1,
+          start: segment.start,
+          end: segment.end,
+          speakerId: segment.speakerId,
+          speakerName: speaker?.name || segment.speakerId,
+          speakerColor: speaker?.color || '#64748b',
+          text: getSegmentDisplayText(segment),
+        }
+      })
+  }, [getSegmentDisplayText, segments, speakers])
   const segmentsBySpeaker = useMemo(() => {
     const map = new Map<string, Segment[]>()
     for (const segment of segments) {
@@ -847,8 +899,21 @@ function AppContent(){
     return counts
   }, [segments])
   useEffect(() => {
-    setQuickSpeakerOpen(false)
-  }, [selectedSegId])
+    if (!inlineSpeakerPicker) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (inlineSpeakerPickerRef.current?.contains(event.target as Node)) return
+      setInlineSpeakerPicker(null)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setInlineSpeakerPicker(null)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [inlineSpeakerPicker?.segmentId])
   useEffect(() => {
     if (segmentSpeakerFilter !== 'all' && !speakers.some((speaker) => speaker.id === segmentSpeakerFilter)) {
       setSegmentSpeakerFilter('all')
@@ -897,6 +962,11 @@ function AppContent(){
       currentText: getSegmentDisplayText(selectedSegment),
     })
   }, [getSegmentDisplayText, selectedSegment, selectedSpeaker?.name, speakers])
+  const selectedReviewEvent = useMemo(() => (
+    selectedSegment && reviewWorkspace
+      ? getLatestReviewEvent(reviewWorkspace, selectedSegment.id)
+      : null
+  ), [reviewWorkspace, selectedSegment])
   const updateSelectedSegment = useCallback((patch: Partial<Segment>) => {
     if (!selectedSegId) return
     setSegments((prev) => prev.map((segment) => (
@@ -1009,7 +1079,7 @@ function AppContent(){
     setSegmentNotesDraft(selectedSegment?.notes || '')
   }, [getSegmentDisplayText, selectedSegment?.id, selectedSegment?.notes, selectedSegment?.text])
   const addSpeaker = useCallback((name?: string, source: Speaker['source'] = 'manual') => {
-    const trimmed = (name || newSpeakerName || '').trim()
+    const trimmed = (name || '').trim()
     const baseName = trimmed || `speaker${speakers.length + 1}`
     const safeId = baseName
       .replace(/\s+/g, '_')
@@ -1024,9 +1094,80 @@ function AppContent(){
     const color = palette[speakers.length % palette.length]
     const speaker: Speaker = { id, name: baseName, color, visible: true, source }
     setSpeakers((prev) => [...prev, speaker])
-    setNewSpeakerName('')
     return speaker
-  }, [newSpeakerName, speakers])
+  }, [speakers])
+  const respondToReviewSuggestion = useCallback((acceptProposal: boolean) => {
+    if (!selectedSegId || !selectedReviewEvent || !reviewWorkspace) return
+    const currentSegment = segmentsRef.current.find((segment) => segment.id === selectedSegId)
+    if (!currentSegment) return
+    const proposal = selectedReviewEvent.proposed_after
+    const currentSpeaker = speakersRef.current.find((speaker) => speaker.id === currentSegment.speakerId)
+    const before = {
+      speaker_id: currentSegment.speakerId,
+      speaker_name: currentSpeaker?.name || currentSegment.speakerId,
+      text: getSegmentDisplayText(currentSegment),
+      start_ms: Math.round(currentSegment.start * 1000),
+      end_ms: Math.round(currentSegment.end * 1000),
+    }
+    const applied = acceptProposal && proposal ? proposal : before
+
+    if (acceptProposal && proposal) {
+      if (!speakersRef.current.some((speaker) => speaker.id === proposal.speaker_id)) {
+        const palette = ['#3B82F6','#EF4444','#10B981','#F59E0B','#8B5CF6','#06B6D4','#84CC16','#EC4899']
+        setSpeakers((current) => [
+          ...current,
+          {
+            id: proposal.speaker_id,
+            name: proposal.speaker_name || proposal.speaker_id,
+            color: palette[current.length % palette.length],
+            visible: true,
+            source: 'manual',
+          },
+        ])
+      }
+      setSegments((current) => current.map((segment) => {
+        if (segment.id !== selectedSegId) return segment
+        const patch: Partial<Segment> = {
+          speakerId: proposal.speaker_id,
+          text: proposal.text,
+          start: proposal.start_ms / 1000,
+          end: proposal.end_ms / 1000,
+          reviewStatus: 'corrected',
+        }
+        return {
+          ...segment,
+          ...preserveOriginalSegmentFields(segment, patch, getSegmentDisplayText(segment)),
+          ...patch,
+          evidence: {
+            ...segment.evidence,
+            text: { source: 'manual', value: proposal.text },
+            fusion: { role: proposal.speaker_name, strategy: 'accepted_review_proposal' },
+          },
+        }
+      }))
+      setSegmentTextDraft(proposal.text)
+    }
+
+    const now = new Date().toISOString()
+    setReviewWorkspace((current) => {
+      if (!current || current.episode_id !== selectedEpisodeId) return current
+      return appendReviewEvent(current, {
+        id: crypto.randomUUID(),
+        round_id: selectedReviewEvent.round_id,
+        segment_id: selectedSegId,
+        actor: { id: 'annotator-local', name: '标注人', role: 'annotator' },
+        action: 'annotator_replied',
+        issue_types: selectedReviewEvent.issue_types,
+        before,
+        proposed_after: applied,
+        reason: acceptProposal && proposal ? '已接受检查建议并完成回改' : '已复查，保留当前标注值',
+        evidence_time_ms: Math.round(currentTime * 1000),
+        created_at: now,
+      })
+    })
+    setToast({ message: acceptProposal && proposal ? '已接受检查建议、完成回改并留下回复痕迹' : '已保留当前值并回复检查人' })
+    window.setTimeout(() => setToast(null), 3600)
+  }, [currentTime, getSegmentDisplayText, reviewWorkspace, selectedEpisodeId, selectedReviewEvent, selectedSegId])
   const [ctxMenu, setCtxMenu] = useState<{x:number; y:number; segId: string} | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<{open: boolean; segId: string} | null>(null)
   const lastDeletedRef = useRef<Segment | null>(null)
@@ -1057,6 +1198,7 @@ function AppContent(){
   const [draftAvailable, setDraftAvailable] = useState(false)
   const [exportIssues, setExportIssues] = useState<ExportIssues | null>(null)
   const draftStorageKey = useMemo(() => `e2cp-rttm-workbench-draft-${selectedEpisodeId}`, [selectedEpisodeId])
+  const reviewStorageKey = useMemo(() => `e2cp-rttm-workbench-review-${selectedEpisodeId}`, [selectedEpisodeId])
   const canUndo = historyCursor > 0
   const canRedo = historyLength > 0 && historyCursor >= 0 && historyCursor < historyLength - 1
   const [playbackRate, setPlaybackRate] = useState<number>(1.0); // 默认 1x
@@ -1068,6 +1210,48 @@ function AppContent(){
       // Local storage is only a convenience for resuming work.
     }
   }, [selectedEpisodeId])
+
+  useEffect(() => {
+    try { window.localStorage.setItem('e2cp-reviewer-name', reviewerName) } catch { /* Optional convenience only. */ }
+  }, [reviewerName])
+
+  useEffect(() => {
+    if (workMode !== 'inspect' || segments.length === 0) return
+    setReviewWorkspace((current) => {
+      if (current?.episode_id === selectedEpisodeId) {
+        return activateReviewRound(
+          ensureReviewSegments(current, segments.map((segment) => segment.id)),
+          { roundNumber: reviewRoundNumber, reviewerName },
+        )
+      }
+      try {
+        const raw = window.localStorage.getItem(reviewStorageKey)
+        if (raw) {
+          const restored = JSON.parse(raw) as ReviewWorkspace
+          if (restored.schema_version === 'e2cp.review_trace.v1' && restored.episode_id === selectedEpisodeId) {
+            setReviewRoundNumber(restored.rounds.find((round) => round.id === restored.active_round_id)?.number || 1)
+            return activateReviewRound(
+              ensureReviewSegments(restored, segments.map((segment) => segment.id)),
+              { roundNumber: reviewRoundNumber, reviewerName },
+            )
+          }
+        }
+      } catch {
+        // A damaged browser draft must not block a new review round.
+      }
+      return createReviewWorkspace({
+        episodeId: selectedEpisodeId,
+        segmentIds: segments.map((segment) => segment.id),
+        reviewerName,
+        roundNumber: reviewRoundNumber,
+      })
+    })
+  }, [reviewRoundNumber, reviewStorageKey, reviewerName, segments, selectedEpisodeId, workMode])
+
+  useEffect(() => {
+    if (!reviewWorkspace || reviewWorkspace.episode_id !== selectedEpisodeId) return
+    try { window.localStorage.setItem(reviewStorageKey, JSON.stringify(reviewWorkspace)) } catch { /* Export remains available. */ }
+  }, [reviewStorageKey, reviewWorkspace, selectedEpisodeId])
 
   useEffect(()=>{
     const closeMenu = () => setCtxMenu(null)
@@ -1268,9 +1452,16 @@ function AppContent(){
           try {
             const raw = String(reader.result)
             let projectSnapshot: DraftPayload | null = null
+            let importedReviewWorkspace: ReviewWorkspace | null = null
             if (target !== 'candidate') {
               try {
-                projectSnapshot = parseReviewProjectSnapshot(raw)
+                const reviewPackage = parseReviewPackage(raw)
+                if (reviewPackage) {
+                  projectSnapshot = parseReviewProjectSnapshot(JSON.stringify(reviewPackage.project))
+                  importedReviewWorkspace = reviewPackage.review
+                } else {
+                  projectSnapshot = parseReviewProjectSnapshot(raw)
+                }
               } catch {
                 projectSnapshot = null
               }
@@ -1283,6 +1474,19 @@ function AppContent(){
               setSelectedSegId(projectSnapshot.selectedSegId)
               setLastDraftSavedAt(projectSnapshot.savedAt)
               setDraftAvailable(true)
+              if (importedReviewWorkspace) {
+                setReviewWorkspace(ensureReviewSegments(importedReviewWorkspace, projectSnapshot.segments.map((segment) => segment.id)))
+                setReviewRoundNumber(importedReviewWorkspace.rounds.find((round) => round.id === importedReviewWorkspace.active_round_id)?.number || 1)
+                setWorkMode('inspect')
+                setLeftCollapsed(true)
+              } else if (workMode === 'inspect') {
+                setReviewWorkspace(createReviewWorkspace({
+                  episodeId: projectSnapshot.selectedEpisodeId,
+                  segmentIds: projectSnapshot.segments.map((segment) => segment.id),
+                  reviewerName,
+                  roundNumber: reviewRoundNumber,
+                }))
+              }
               if (typeof projectSnapshot.lastPlaybackTime === 'number' && Number.isFinite(projectSnapshot.lastPlaybackTime)) {
                 setCurrentTime(projectSnapshot.lastPlaybackTime)
                 if (videoRef.current) videoRef.current.currentTime = projectSnapshot.lastPlaybackTime
@@ -1290,13 +1494,13 @@ function AppContent(){
               if (projectSnapshot.sourceFiles.rttm) {
                 setRTTM({ id: 'project-rttm', name: projectSnapshot.sourceFiles.rttm, url: '', matched: true })
               }
-              setPackageNotice(`已从工程 JSON 恢复 ${episodeLabelFromId(projectSnapshot.selectedEpisodeId)}，请重新上传媒体文件后继续播放与校对。`)
-              setToast({ message: `已恢复工程 JSON：${f.name}，可继续上次标注` })
+              setPackageNotice(`已从${importedReviewWorkspace ? '复核包' : '工程 JSON'}恢复 ${episodeLabelFromId(projectSnapshot.selectedEpisodeId)}，请重新上传媒体文件后继续播放与校对。`)
+              setToast({ message: importedReviewWorkspace ? `已恢复复核包：${f.name}，全部检查痕迹已载入` : `已恢复工程 JSON：${f.name}，可继续上次标注` })
               window.setTimeout(()=>{ setToast(null) }, 4200)
               return
             }
             if (target === 'project') {
-              throw new Error('这不是工具导出的工程 JSON，请选择 *_review_project.json 或 *_annotation_project.json')
+              throw new Error('这不是有效的标注工程或复核包，请选择 *_review_project.json、*_annotation_project.json 或 *_review_package.json')
             }
 
             const entries = parseCandidateJSON(raw)
@@ -1388,6 +1592,11 @@ function AppContent(){
     () => segments.slice().sort((a, b) => a.start - b.start).map((segment, index) => ({ segment, index })),
     [segments],
   )
+  const selectedSegmentRowNumber = useMemo(() => {
+    if (!selectedSegId) return 0
+    const selectedIndex = sortedSegmentRows.findIndex(({ segment }) => segment.id === selectedSegId)
+    return selectedIndex >= 0 ? selectedIndex + 1 : 0
+  }, [selectedSegId, sortedSegmentRows])
   const filteredSegmentRows = useMemo(() => {
     return filterDialogueRows(sortedSegmentRows, {
       status: segmentStatusFilter,
@@ -1465,6 +1674,7 @@ function AppContent(){
   }, [followPlayback, scrollDialogueRowIntoView, selectedSegId])
   const onDialogueListScroll = useCallback(() => {
     setDialogueScrollTop(dialogueListRef.current?.scrollTop ?? 0)
+    setInlineSpeakerPicker(null)
     if (autoDialogueScrollingRef.current) return
     if (followPlayback) setFollowPlayback(false)
   }, [followPlayback])
@@ -1607,12 +1817,41 @@ function AppContent(){
   const isReadyForAnnotation = missingRequiredCount === 0
   const requiredLoadedCount = episodeRequirementRows.filter((row) => row.required && row.state === 'loaded').length
   const requiredTotalCount = episodeRequirementRows.filter((row) => row.required).length
-  const modeLabel = workMode === 'prepare' ? '准备模式' : '标注模式'
+  const modeLabel = workMode === 'prepare' ? '准备模式' : workMode === 'annotate' ? '标注模式' : '检查模式'
+  const effectiveReviewWorkspace = useMemo(() => reviewWorkspace ?? createReviewWorkspace({
+    episodeId: selectedEpisodeId,
+    segmentIds: segments.map((segment) => segment.id),
+    reviewerName,
+    roundNumber: reviewRoundNumber,
+  }), [reviewRoundNumber, reviewWorkspace, reviewerName, segments, selectedEpisodeId])
+  const reviewSummary = useMemo(
+    () => summarizeReviewWorkspace(effectiveReviewWorkspace),
+    [effectiveReviewWorkspace],
+  )
+  const reviewIssueMarkers = useMemo(() => {
+    if (!reviewWorkspace) return []
+    return segments.flatMap((segment) => {
+      const state = reviewWorkspace.segment_states[segment.id]
+      if (!state || !['issue_open', 'awaiting_annotator', 'annotator_replied'].includes(state.status)) return []
+      const event = getLatestReviewEvent(reviewWorkspace, segment.id)
+      return [{
+        id: segment.id,
+        time: (event?.evidence_time_ms ?? Math.round(segment.start * 1000)) / 1000,
+        status: state.status,
+        label: event?.reason || '复核问题',
+      }]
+    })
+  }, [reviewWorkspace, segments])
   const episodeOptions = useMemo(
     () => Array.from({ length: 30 }, (_, index) => normalizeEpisodeId(index + 1)),
     [],
   )
   useEffect(() => {
+    if (workMode === 'inspect') {
+      setRightCollapsed(false)
+      setLeftCollapsed(true)
+      return
+    }
     if (!isReadyForAnnotation) {
       hasAutoEnteredAnnotationRef.current = false
       setWorkMode('prepare')
@@ -1626,7 +1865,7 @@ function AppContent(){
       setWorkMode('annotate')
       if (!resourcePanelManuallyChangedRef.current) setLeftCollapsed(true)
     }
-  }, [hasRTTM, hasSRT, isReadyForAnnotation])
+  }, [hasRTTM, hasSRT, isReadyForAnnotation, segments.length, workMode])
   const toggleResourcePanel = useCallback(() => {
     resourcePanelManuallyChangedRef.current = true
     setLeftCollapsed((value) => !value)
@@ -1636,9 +1875,10 @@ function AppContent(){
     if (mode === 'prepare') {
       resourcePanelManuallyChangedRef.current = true
       setLeftCollapsed(false)
-    } else if (isReadyForAnnotation) {
+    } else if (mode === 'inspect' || isReadyForAnnotation) {
       resourcePanelManuallyChangedRef.current = true
       setLeftCollapsed(true)
+      setRightCollapsed(false)
     }
   }, [isReadyForAnnotation])
 
@@ -1690,16 +1930,94 @@ function AppContent(){
     seek(target.segment.start)
   }
   const markSelectedAsChecked = () => {
-    if (!selectedSegId) return
-    updateSelectedSegment({ reviewStatus: 'checked' })
-  }
-  const assignSelectedSpeaker = (speaker: Speaker) => {
     if (!selectedSegment) return
     updateSelectedSegment({
-      speakerId: speaker.id,
-      evidence: { fusion: { role: speaker.name, strategy: 'manual_speaker_quick_assign' } },
-      reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
+      reviewStatus: getReviewStatusAfterPass(selectedSegment.reviewStatus),
     })
+  }
+  const openInlineSpeakerPicker = (
+    segment: Segment,
+    anchor: { left: number; right: number; top: number; bottom: number },
+    mode: 'assign' | 'add' = 'assign',
+    seekToSegment = true,
+  ) => {
+    const pickerWidth = Math.min(580, Math.max(300, window.innerWidth - 24))
+    const pickerHeight = Math.min(560, Math.max(360, window.innerHeight * 0.65))
+    const position = getSpeakerPickerPosition(
+      anchor,
+      { width: window.innerWidth, height: window.innerHeight },
+      { width: pickerWidth, height: pickerHeight },
+    )
+    setFollowPlayback(false)
+    filteredPlaybackSessionRef.current = false
+    setSelectedSegId(segment.id)
+    if (seekToSegment) seek(segment.start)
+    setInlineSpeakerPicker({ segmentId: segment.id, mode, query: '', ...position })
+  }
+  const assignSpeakerToSegment = (
+    segmentId: string,
+    speaker: Speaker,
+    strategy = 'manual_speaker_inline_assign',
+  ) => {
+    const previousSegment = segmentsRef.current.find((segment) => segment.id === segmentId)
+    if (!previousSegment || previousSegment.speakerId === speaker.id) {
+      setInlineSpeakerPicker(null)
+      return
+    }
+    const previousSnapshot = cloneSegments([previousSegment])[0]
+    const previousSpeaker = speakersRef.current.find((item) => item.id === previousSegment.speakerId)
+    setSegments((currentSegments) => currentSegments.map((segment) => {
+      if (segment.id !== segmentId) return segment
+      const patch: Partial<Segment> = {
+        speakerId: speaker.id,
+        evidence: { fusion: { role: speaker.name, strategy } },
+      }
+      return {
+        ...segment,
+        ...preserveOriginalSegmentFields(segment, patch, getSegmentDisplayText(segment)),
+        ...patch,
+        reviewStatus: getReviewStatusAfterSegmentPatch(segment, patch),
+        evidence: { ...segment.evidence, ...patch.evidence },
+      }
+    }))
+    setRecentSpeakerIds((current) => updateRecentSpeakerIds(current, speaker.id))
+    setInlineSpeakerPicker(null)
+    const speakerChangeToast = {
+      message: `说话人已由“${previousSpeaker?.name || previousSegment.speakerId}”改为“${speaker.name}”，状态已标记为 corrected`,
+      actionLabel: '撤销',
+      onAction: () => {
+        setSegments((currentSegments) => currentSegments.map((segment) => (
+          segment.id === segmentId ? previousSnapshot : segment
+        )))
+        setToast(null)
+      },
+    }
+    setToast(speakerChangeToast)
+    window.setTimeout(() => {
+      setToast((current) => current === speakerChangeToast ? null : current)
+    }, 6000)
+  }
+  const addInlineSpeakerAndAssign = () => {
+    if (!inlineSpeakerPickerSegment || !inlineSpeakerPicker?.query.trim()) return
+    const query = inlineSpeakerPicker.query.trim()
+    const existing = speakers.find((speaker) => speaker.id === query || speaker.name === query)
+    const speaker = existing || addSpeaker(query, 'manual')
+    assignSpeakerToSegment(inlineSpeakerPickerSegment.id, speaker, 'manual_new_speaker_inline_assign')
+  }
+  const addInlineSpeakerOnly = () => {
+    const query = inlineSpeakerPicker?.query.trim()
+    if (!query) return
+    const existing = speakers.find((speaker) => speaker.id === query || speaker.name === query)
+    if (existing) {
+      setToast({ message: `说话人“${existing.name}”已经存在，可直接选择使用。` })
+      window.setTimeout(() => setToast(null), 3200)
+      return
+    }
+    const speaker = addSpeaker(query, 'manual')
+    setRecentSpeakerIds((current) => updateRecentSpeakerIds(current, speaker.id))
+    setInlineSpeakerPicker(null)
+    setToast({ message: `已新增说话人“${speaker.name}”，尚未修改当前台词。` })
+    window.setTimeout(() => setToast(null), 3200)
   }
   const markFilteredPendingRowsAsChecked = () => {
     const rows = filteredSegmentRows
@@ -2481,10 +2799,7 @@ function AppContent(){
     return true
   }
 
-  // export project (segments + speakers) JSON
-  const exportJSON = () => {
-    if (!validateBeforeExport('工程 JSON')) return
-    const data = buildEpisodeProject({
+  const buildCurrentProject = () => buildEpisodeProject({
       media: media ? { ...media, duration } : null,
       rttm,
       refRTTM,
@@ -2496,6 +2811,11 @@ function AppContent(){
       refSegments,
       missingRanges: waveMissingRanges,
     })
+
+  // export project (segments + speakers) JSON
+  const exportJSON = () => {
+    if (!validateBeforeExport('工程 JSON')) return
+    const data = buildCurrentProject()
     const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'})
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -2503,6 +2823,73 @@ function AppContent(){
     a.href = url; a.download = `${fileId}_review_project.json`; a.click()
     URL.revokeObjectURL(url)
   }
+
+  const exportReviewProgress = (status: 'draft' | 'submitted') => {
+    if (segments.length === 0) {
+      setToast({ message: '没有可保存的复核内容，请先导入标注工程。' })
+      window.setTimeout(() => setToast(null), 3500)
+      return
+    }
+    const data = buildReviewPackage({
+      project: buildCurrentProject(),
+      review: ensureReviewSegments(effectiveReviewWorkspace, segments.map((segment) => segment.id)),
+      status,
+    })
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    const fileId = episodeLabelFromId(selectedEpisodeId).toLowerCase()
+    anchor.href = url
+    anchor.download = `${fileId}_review_round${reviewRoundNumber}_${status === 'draft' ? 'progress' : 'package'}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+    setToast({ message: status === 'draft' ? '复核进度已保存，可在任何电脑导入后继续。' : '复核包已导出，包含标注工程和全部检查痕迹。' })
+    window.setTimeout(() => setToast(null), 4200)
+  }
+
+  const handleReviewAction = useCallback((segment: ReviewDisplaySegment, request: ReviewActionRequest) => {
+    const now = new Date().toISOString()
+    setReviewWorkspace((current) => {
+      let workspace = current?.episode_id === selectedEpisodeId
+        ? ensureReviewSegments(current, segmentsRef.current.map((item) => item.id))
+        : createReviewWorkspace({
+            episodeId: selectedEpisodeId,
+            segmentIds: segmentsRef.current.map((item) => item.id),
+            reviewerName,
+            roundNumber: reviewRoundNumber,
+            now,
+          })
+      const activeRound = workspace.rounds.find((round) => round.id === workspace.active_round_id)
+      const event: ReviewEvent = {
+        id: crypto.randomUUID(),
+        round_id: workspace.active_round_id,
+        segment_id: segment.id,
+        actor: {
+          id: activeRound?.reviewer.id || `reviewer-${reviewerName || 'anonymous'}`,
+          name: reviewerName.trim() || activeRound?.reviewer.name || '未命名复核人',
+          role: 'reviewer',
+        },
+        action: request.action,
+        issue_types: request.issueTypes,
+        before: request.before,
+        proposed_after: request.proposedAfter,
+        reason: request.reason,
+        evidence_time_ms: request.evidenceTimeMs,
+        created_at: now,
+      }
+      workspace = appendReviewEvent(workspace, event)
+      return workspace
+    })
+    const actionLabel = request.action === 'approved'
+      ? '已通过本句'
+      : request.action === 'resolved'
+        ? '已确认回改并解决'
+        : request.action === 'change_proposed'
+          ? '修改建议已提交并留痕'
+          : '问题已记录并留痕'
+    setToast({ message: actionLabel })
+    window.setTimeout(() => setToast(null), 2600)
+  }, [reviewRoundNumber, reviewerName, selectedEpisodeId])
 
   const exportRTTM = () => {
     if (!validateBeforeExport('RTTM')) return
@@ -2822,6 +3209,27 @@ function AppContent(){
             <div className="topbar-subtitle">{modeLabel}</div>
           </div>
         </div>
+        {workMode === 'inspect' ? (
+          <>
+            <div className="mode-switch inspection-mode-switch">
+              <button onClick={() => changeWorkMode('prepare')}>准备</button>
+              <button onClick={() => changeWorkMode('annotate')} disabled={!isReadyForAnnotation}>标注</button>
+              <button className="active" onClick={() => changeWorkMode('inspect')}>检查</button>
+            </div>
+            <div className="inspection-top-meta">
+              <strong>{episodeLabelFromId(selectedEpisodeId)}</strong>
+              <label>复核人：<input value={reviewerName} onChange={(event) => setReviewerName(event.target.value)} /></label>
+              <label>第 <input type="number" min={1} value={reviewRoundNumber} onChange={(event) => setReviewRoundNumber(Math.max(1, Number(event.target.value) || 1))} /> 轮复核</label>
+              <span><b>{reviewSummary.reviewed}</b> / {reviewSummary.total}</span>
+            </div>
+            <div className="topbar-actions inspection-top-actions">
+              <button className="btn tiny" onClick={() => projectInputRef.current?.click()}><Upload className="file-icon" />导入标注工程</button>
+              <button className="btn tiny" onClick={() => exportReviewProgress('draft')}><Download className="file-icon" />保存复核进度</button>
+              <button className="btn tiny primary-action" onClick={() => exportReviewProgress('submitted')}><Download className="file-icon" />导出复核包</button>
+            </div>
+          </>
+        ) : (
+          <>
         <div className="topbar-status">
           <span className="status-chip selected-chip">{episodeLabelFromId(selectedEpisodeId)}</span>
           <span className={`status-chip ${media ? 'ok' : 'blocked'}`}>媒体 {media ? '已加载' : '缺失'}</span>
@@ -2838,11 +3246,14 @@ function AppContent(){
           <div className="mode-switch">
             <button className={workMode === 'prepare' ? 'active' : ''} onClick={() => changeWorkMode('prepare')}>准备</button>
             <button className={workMode === 'annotate' ? 'active' : ''} onClick={() => changeWorkMode('annotate')} disabled={!isReadyForAnnotation}>标注</button>
+            <button onClick={() => changeWorkMode('inspect')}>检查</button>
           </div>
           <button className="btn tiny" onClick={() => projectInputRef.current?.click()}><Upload className="file-icon" />导入工程JSON继续</button>
           <button className="btn tiny" onClick={exportRTTM}><Download className="file-icon" />导出RTTM</button>
           <button className="btn tiny primary-action" onClick={exportJSON}><Download className="file-icon" />保存进度JSON</button>
         </div>
+          </>
+        )}
       </div>
       <input ref={projectInputRef} type="file" style={{display:'none'}} accept=".json"
         onChange={(event) => {
@@ -2850,8 +3261,9 @@ function AppContent(){
           event.currentTarget.value = ''
         }} />
 
-      <div className="layout">
+      <div className={`layout${workMode === 'inspect' ? ' inspection-layout' : ''}`}>
         {/* Left panel: resource loading and checks */}
+        {workMode !== 'inspect' && (
         <div className={"panel resource-panel section" + (leftCollapsed ? ' collapsed' : '')}
           onDragOver={(e)=>{e.preventDefault(); setDragOver(true)}}
           onDragLeave={()=>setDragOver(false)}
@@ -3045,6 +3457,7 @@ function AppContent(){
             </>
           )}
         </div>
+        )}
 
         {/* Center content: video + controls + timeline (resizable video area, scrollable tracks) */}
         <div className="center" ref={centerRef}>
@@ -3180,6 +3593,21 @@ function AppContent(){
                     }}
                     onPointerDown={(event) => event.stopPropagation()}
                   />
+                ))}
+                {workMode === 'inspect' && reviewIssueMarkers.map((marker) => (
+                  <button
+                    key={marker.id}
+                    type="button"
+                    className={`review-issue-marker marker-${marker.status}`}
+                    style={{ left: marker.time * pxPerSec }}
+                    title={marker.label}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setSelectedSegId(marker.id)
+                      seek(marker.time)
+                    }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                  >!</button>
                 ))}
                 {(waveFailed || waveLoading) && (
                   <div className="badge-sm" style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center'}}>
@@ -3493,61 +3921,27 @@ function AppContent(){
         </div>
 
         {/* Right panel: current segment review + full dialogue list */}
-        <div className={"panel right section" + (rightCollapsed ? ' collapsed' : '')}>
-          {!rightCollapsed && (
+        <div className={"panel right section" + (rightCollapsed ? ' collapsed' : '') + (workMode === 'inspect' ? ' inspection-panel' : '')}>
+          {workMode === 'inspect' ? (
+            <ReviewWorkbench
+              segments={reviewDisplaySegments}
+              speakers={speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }))}
+              selectedSegmentId={selectedSegId}
+              currentTime={currentTime}
+              workspace={effectiveReviewWorkspace}
+              onSelectSegment={(segment) => {
+                setSelectedSegId(segment.id)
+                seek(segment.start)
+              }}
+              onReviewAction={handleReviewAction}
+            />
+          ) : !rightCollapsed && (
             <div className="right-workbench">
               <div className="card fade-in inspector-card current-segment-card">
                 <div className="row inspector-title-row">
                   <div>
-                    <div style={{fontWeight:800}}>当前片段校对</div>
-                    <div className="badge-sm">文本和说话人都正确时，只点“通过检查”</div>
-                  </div>
-                  <div className="review-primary-actions">
-                    {getReviewPrimaryActionOrder(Boolean(selectedSegment)).map((action) => {
-                      if (action === 'nextPending') {
-                        return (
-                          <button
-                            key={action}
-                            className="btn tiny"
-                            disabled={reviewProgress.counts.pending === 0}
-                            onClick={() => jumpToNextStatus('pending')}
-                          >
-                            {REVIEW_PRIMARY_ACTION_LABELS.nextPending}
-                          </button>
-                        )
-                      }
-                      if (action === 'changeSpeaker') {
-                        return (
-                          <button
-                            key={action}
-                            type="button"
-                            className={`btn tiny speaker-action-btn${quickSpeakerOpen ? ' active' : ''}`}
-                            onClick={() => setQuickSpeakerOpen((open) => !open)}
-                            aria-expanded={quickSpeakerOpen}
-                          >
-                            {quickSpeakerOpen ? '收起说话人' : REVIEW_PRIMARY_ACTION_LABELS.changeSpeaker}
-                          </button>
-                        )
-                      }
-                      if (action === 'insertMissing') {
-                        return (
-                          <button
-                            key={action}
-                            type="button"
-                            className={`btn tiny missing-action-btn${missingInsertOpen ? ' active' : ''}`}
-                            onClick={() => setMissingInsertOpen((open) => !open)}
-                            aria-expanded={missingInsertOpen}
-                          >
-                            {missingInsertOpen ? '收起漏句' : REVIEW_PRIMARY_ACTION_LABELS.insertMissing}
-                          </button>
-                        )
-                      }
-                      return (
-                        <button key={action} className="btn tiny pass-btn" onClick={markSelectedAsChecked}>
-                          {REVIEW_PRIMARY_ACTION_LABELS.pass}
-                        </button>
-                      )
-                    })}
+                    <div style={{fontWeight:800}}>时间与文本精细校对</div>
+                    <div className="badge-sm">开始时间、结束时间和台词始终可编辑；高频操作集中在上方台词列表。</div>
                   </div>
                 </div>
                 {!selectedSegment ? (
@@ -3576,106 +3970,33 @@ function AppContent(){
                         )}
                       </div>
                     )}
-                    {quickSpeakerOpen && (
-                      <div className="quick-speaker-panel open">
-                        <div className="quick-panel-title">选择正确说话人</div>
-                        <div className="quick-speaker-grid">
-                          {speakers.length === 0 && (
-                            <div className="badge-sm">暂无说话人，可在下方新增。</div>
-                          )}
-                          {speakers.map((speaker) => {
-                            const usageCount = speakerUsageCounts.get(speaker.id) || 0
-                            const isManualSpeaker = speaker.source === 'manual'
-                            return (
-                              <div
-                                key={speaker.id}
-                                className={`speaker-chip-shell${speaker.id === selectedSegment.speakerId ? ' active' : ''}${isManualSpeaker ? ' manual' : ''}`}
-                              >
-                                <button
-                                  type="button"
-                                  className="speaker-chip"
-                                  onClick={() => assignSelectedSpeaker(speaker)}
-                                  title={`将当前片段标为 ${speaker.name}`}
-                                >
-                                  <span style={{background: speaker.color}} />
-                                  {speaker.name}
-                                </button>
-                                {isManualSpeaker && (
-                                  <button
-                                    type="button"
-                                    className={`speaker-chip-delete${usageCount > 0 ? ' blocked' : ''}`}
-                                    onClick={(event) => {
-                                      event.stopPropagation()
-                                      removeManualSpeaker(speaker)
-                                    }}
-                                    title={usageCount > 0
-                                      ? `已有 ${usageCount} 个片段使用该说话人，先改掉这些片段再删除`
-                                      : `删除人工新增说话人 ${speaker.name}`}
-                                    aria-label={`删除人工新增说话人 ${speaker.name}`}
-                                  >
-                                    <Trash2 size={12} />
-                                  </button>
-                                )}
-                              </div>
-                            )
-                          })}
+                    {selectedReviewEvent && ['issue_reported', 'change_proposed', 'reopened'].includes(selectedReviewEvent.action) && (
+                      <section className="review-feedback-card">
+                        <div className="review-feedback-heading">
+                          <div>
+                            <strong>检查人反馈</strong>
+                            <span>{selectedReviewEvent.actor.name} · {new Date(selectedReviewEvent.created_at).toLocaleString('zh-CN', { hour12: false })}</span>
+                          </div>
+                          <span className="review-feedback-status">待回改</span>
                         </div>
-                        <div className="speaker-add-inline">
-                          <input
-                            value={newSpeakerName}
-                            onChange={(event) => setNewSpeakerName(event.target.value)}
-                            placeholder="新增说话人，例如 杨冬"
-                          />
-                          <button className="btn tiny" onClick={() => addSpeaker()}><Plus size={14}/>添加</button>
+                        <p>{selectedReviewEvent.reason || '检查人未填写具体原因'}</p>
+                        <div className="review-feedback-compare">
+                          <div><small>检查前</small><b>{selectedReviewEvent.before.speaker_name}</b><span>{selectedReviewEvent.before.text || '（空台词）'}</span></div>
+                          <span>→</span>
+                          <div><small>检查建议</small><b>{selectedReviewEvent.proposed_after?.speaker_name || '未提出新值'}</b><span>{selectedReviewEvent.proposed_after?.text || '未提出文本修改'}</span></div>
+                        </div>
+                        <div className="review-feedback-actions">
                           <button
-                            className="btn tiny"
-                            onClick={() => {
-                              const speaker = addSpeaker(undefined, 'manual')
-                              updateSelectedSegment({
-                                speakerId: speaker.id,
-                                reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
-                                evidence: { fusion: { role: speaker.name, strategy: 'manual_new_speaker' } },
-                              })
-                            }}
-                          >
-                            添加并用于当前
-                          </button>
+                            type="button"
+                            className="btn tiny primary-action"
+                            disabled={!selectedReviewEvent.proposed_after}
+                            onClick={() => respondToReviewSuggestion(true)}
+                          >接受建议并回改</button>
+                          <button type="button" className="btn tiny" onClick={() => respondToReviewSuggestion(false)}>保留当前值并回复</button>
                         </div>
-                      </div>
+                      </section>
                     )}
                     <div className="editor-grid">
-                      <label className="field">
-                        <span>说话人</span>
-                        <select
-                          value={selectedSegment.speakerId}
-                          onChange={(event) => updateSelectedSegment({
-                            speakerId: event.target.value,
-                            evidence: { fusion: { role: event.target.value, strategy: 'manual_speaker_review' } },
-                            reviewStatus: selectedSegment.reviewStatus === 'pending' ? 'corrected' : selectedSegment.reviewStatus,
-                          })}
-                        >
-                          {speakers.length === 0 && (
-                            <option value={selectedSegment.speakerId}>{selectedSegment.speakerId}</option>
-                          )}
-                          {speakers.map((speaker) => (
-                            <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="field">
-                        <span>状态</span>
-                        <select
-                          value={selectedSegment.reviewStatus || 'pending'}
-                          onChange={(event) => updateSelectedSegment({ reviewStatus: event.target.value as ReviewStatus })}
-                        >
-                          <option value="pending">pending</option>
-                          <option value="checked">checked</option>
-                          <option value="corrected">corrected</option>
-                          <option value="inserted">inserted</option>
-                          <option value="uncertain">uncertain</option>
-                          <option value="deleted">deleted</option>
-                        </select>
-                      </label>
                       <label className="field">
                         <span>开始秒</span>
                         <input
@@ -3707,97 +4028,6 @@ function AppContent(){
                         />
                       </label>
                     </div>
-                    {missingInsertOpen && (
-                      <div className="missing-insert-card quick-missing-card">
-                        <div className="quick-panel-title">漏句插入向导</div>
-                        <div className="missing-pick-toolbar">
-                          <button
-                            className={`btn tiny${missingPickMode === 'start' ? ' active' : ''}`}
-                            onClick={() => setMissingPickMode((mode) => mode === 'start' ? 'idle' : 'start')}
-                          >
-                            取开始点
-                          </button>
-                          <button
-                            className={`btn tiny${missingPickMode === 'end' ? ' active' : ''}`}
-                            onClick={() => setMissingPickMode((mode) => mode === 'end' ? 'idle' : 'end')}
-                          >
-                            取结束点
-                          </button>
-                          <button
-                            className={`btn tiny${missingPickMode === 'range' ? ' active' : ''}`}
-                            onClick={() => setMissingPickMode((mode) => mode === 'range' ? 'idle' : 'range')}
-                          >
-                            框选漏句
-                          </button>
-                          {missingPickMode !== 'idle' && (
-                            <button
-                              className="btn tiny"
-                              onClick={() => {
-                                setMissingPickMode('idle')
-                                setMissingRangePreviewNow(null)
-                                missingRangeAnchorRef.current = null
-                              }}
-                            >
-                              取消取点
-                            </button>
-                          )}
-                        </div>
-                        <div className="missing-pick-hint">
-                          {missingPickMode === 'start' && '请点击左侧波形/时间轴，自动填入漏句开始秒。'}
-                          {missingPickMode === 'end' && '请点击左侧波形/时间轴，自动填入漏句结束秒。'}
-                          {missingPickMode === 'range' && '请在左侧波形/时间轴拖拽一段范围，自动填入开始秒和结束秒。'}
-                          {missingPickMode === 'idle' && '需要补漏句时，可先框选波形再点“插入漏句”；插入后会立刻进入时间轴、右侧列表、工程草稿和导出结果。'}
-                        </div>
-                        <div className="missing-insert-grid">
-                          <label className="field">
-                            <span>开始秒</span>
-                            <input
-                              type="number"
-                              min={0}
-                              step={0.01}
-                              value={missingInsertDraft.start}
-                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, start: event.target.value }))}
-                              placeholder="8.47"
-                            />
-                          </label>
-                          <label className="field">
-                            <span>结束秒</span>
-                            <input
-                              type="number"
-                              min={0}
-                              step={0.01}
-                              value={missingInsertDraft.end}
-                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, end: event.target.value }))}
-                              placeholder="8.57"
-                            />
-                          </label>
-                          <label className="field">
-                            <span>说话人</span>
-                            <select
-                              value={missingInsertDraft.speakerId || selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'}
-                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, speakerId: event.target.value }))}
-                            >
-                              {speakers.length === 0 && <option value="UNKNOWN">UNKNOWN</option>}
-                              {speakers.map((speaker) => (
-                                <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
-                              ))}
-                            </select>
-                          </label>
-                          <label className="field">
-                            <span>台词</span>
-                            <input
-                              value={missingInsertDraft.text}
-                              onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, text: event.target.value }))}
-                              placeholder="可先留空，稍后补"
-                            />
-                          </label>
-                        </div>
-                        <div className="row" style={{justifyContent:'space-between', gap:8}}>
-                          <span className="badge-sm">插入后先进入当前工程状态；需导出 RTTM / 工程 JSON 才会保存到文件</span>
-                          <button className="btn tiny pass-btn" onClick={insertMissingDraft}>插入漏句</button>
-                        </div>
-                      </div>
-                    )}
                     <details className="more-actions">
                       <summary>更多操作：候选证据 / 原始值恢复 / 备注</summary>
                       <div className="candidate-panel">
@@ -3897,6 +4127,115 @@ function AppContent(){
                 )}
               </div>
 
+              <section className={`card fade-in right-missing-insert-panel${missingInsertOpen ? ' open' : ''}`}>
+                <button
+                  type="button"
+                  className="right-missing-insert-toggle"
+                  onClick={() => setMissingInsertOpen((open) => !open)}
+                  aria-expanded={missingInsertOpen}
+                  aria-controls="right-missing-insert-content"
+                >
+                  <span className="right-missing-insert-title"><Plus size={15} />插入漏句</span>
+                  <span className="right-missing-insert-summary">
+                    {missingInsertDraft.start && missingInsertDraft.end
+                      ? `${missingInsertDraft.start}s - ${missingInsertDraft.end}s`
+                      : '框选波形或手动填写时间'}
+                  </span>
+                  <span className="right-missing-insert-action">{missingInsertOpen ? '收起' : '展开'}</span>
+                </button>
+                {missingInsertOpen && (
+                  <div id="right-missing-insert-content" className="missing-insert-card quick-missing-card">
+                    <div className="quick-panel-title">漏句插入向导</div>
+                    <div className="missing-pick-toolbar">
+                      <button
+                        className={`btn tiny${missingPickMode === 'start' ? ' active' : ''}`}
+                        onClick={() => setMissingPickMode((mode) => mode === 'start' ? 'idle' : 'start')}
+                      >
+                        取开始点
+                      </button>
+                      <button
+                        className={`btn tiny${missingPickMode === 'end' ? ' active' : ''}`}
+                        onClick={() => setMissingPickMode((mode) => mode === 'end' ? 'idle' : 'end')}
+                      >
+                        取结束点
+                      </button>
+                      <button
+                        className={`btn tiny${missingPickMode === 'range' ? ' active' : ''}`}
+                        onClick={() => setMissingPickMode((mode) => mode === 'range' ? 'idle' : 'range')}
+                      >
+                        框选漏句
+                      </button>
+                      {missingPickMode !== 'idle' && (
+                        <button
+                          className="btn tiny"
+                          onClick={() => {
+                            setMissingPickMode('idle')
+                            setMissingRangePreviewNow(null)
+                            missingRangeAnchorRef.current = null
+                          }}
+                        >
+                          取消取点
+                        </button>
+                      )}
+                    </div>
+                    <div className="missing-pick-hint">
+                      {missingPickMode === 'start' && '请点击左侧波形/时间轴，自动填入漏句开始秒。'}
+                      {missingPickMode === 'end' && '请点击左侧波形/时间轴，自动填入漏句结束秒。'}
+                      {missingPickMode === 'range' && '请在左侧波形/时间轴拖拽一段范围，自动填入开始秒和结束秒。'}
+                      {missingPickMode === 'idle' && '需要补漏句时，可先框选波形再点“插入漏句”；插入后会立刻进入时间轴、右侧列表、工程草稿和导出结果。'}
+                    </div>
+                    <div className="missing-insert-grid">
+                      <label className="field">
+                        <span>开始秒</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.01}
+                          value={missingInsertDraft.start}
+                          onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, start: event.target.value }))}
+                          placeholder="8.47"
+                        />
+                      </label>
+                      <label className="field">
+                        <span>结束秒</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.01}
+                          value={missingInsertDraft.end}
+                          onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, end: event.target.value }))}
+                          placeholder="8.57"
+                        />
+                      </label>
+                      <label className="field">
+                        <span>说话人</span>
+                        <select
+                          value={missingInsertDraft.speakerId || selectedSegment?.speakerId || speakers[0]?.id || 'UNKNOWN'}
+                          onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, speakerId: event.target.value }))}
+                        >
+                          {speakers.length === 0 && <option value="UNKNOWN">UNKNOWN</option>}
+                          {speakers.map((speaker) => (
+                            <option key={speaker.id} value={speaker.id}>{speaker.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="field">
+                        <span>台词</span>
+                        <input
+                          value={missingInsertDraft.text}
+                          onChange={(event) => setMissingInsertDraft((prev) => ({ ...prev, text: event.target.value }))}
+                          placeholder="可先留空，稍后补"
+                        />
+                      </label>
+                    </div>
+                    <div className="row missing-insert-footer">
+                      <span className="badge-sm">插入后先进入当前工程状态；需导出 RTTM / 工程 JSON 才会保存到文件</span>
+                      <button className="btn tiny pass-btn" onClick={insertMissingDraft}>插入漏句</button>
+                    </div>
+                  </div>
+                )}
+              </section>
+
               <div className="right-scroll">
                 {segments.length > 0 && (
                   <div className="card fade-in segment-card dialogue-list-card">
@@ -3904,6 +4243,75 @@ function AppContent(){
                       <div>
                         <div style={{fontWeight:700}}>完整台词列表</div>
                         <div className="badge-sm">显示 {dialogueRows.length} / {sortedSegmentRows.length}，点击任意行跳转</div>
+                      </div>
+                    </div>
+                    <div className="dialogue-workbar" aria-label="当前台词快捷校对">
+                      <div className="dialogue-workbar-current">
+                        <span className="dialogue-workbar-eyebrow">
+                          {selectedSegmentRowNumber > 0 ? `当前第 ${selectedSegmentRowNumber} 句` : '尚未选择台词'}
+                        </span>
+                        {selectedSegment ? (
+                          <div className="dialogue-workbar-meta">
+                            <span>{formatHMSms(selectedSegment.start)} - {formatHMSms(selectedSegment.end)}</span>
+                            <button
+                              type="button"
+                              className="dialogue-workbar-speaker"
+                              title="修改当前台词说话人"
+                              onClick={(event) => openInlineSpeakerPicker(
+                                selectedSegment,
+                                event.currentTarget.getBoundingClientRect(),
+                                'assign',
+                                false,
+                              )}
+                            >
+                              {selectedSpeaker?.name || selectedSegment.speakerId}
+                              <Pencil size={12} />
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="badge-sm">点击下方任意台词开始校对</span>
+                        )}
+                      </div>
+                      <label className="dialogue-workbar-status">
+                        <span>状态</span>
+                        <select
+                          disabled={!selectedSegment}
+                          value={selectedSegment?.reviewStatus || 'pending'}
+                          onChange={(event) => updateSelectedSegment({ reviewStatus: event.target.value as ReviewStatus })}
+                        >
+                          <option value="pending">pending</option>
+                          <option value="checked">checked</option>
+                          <option value="corrected">corrected</option>
+                          <option value="inserted">inserted</option>
+                          <option value="uncertain">uncertain</option>
+                          <option value="deleted">deleted</option>
+                        </select>
+                      </label>
+                      <div className="dialogue-workbar-actions">
+                        <button
+                          type="button"
+                          className="btn tiny"
+                          disabled={!selectedSegment}
+                          onClick={(event) => {
+                            if (!selectedSegment) return
+                            openInlineSpeakerPicker(
+                              selectedSegment,
+                              event.currentTarget.getBoundingClientRect(),
+                              'add',
+                              false,
+                            )
+                          }}
+                        >
+                          <Plus size={14} />新增说话人
+                        </button>
+                        <button
+                          type="button"
+                          className="btn tiny pass-btn"
+                          disabled={!selectedSegment}
+                          onClick={markSelectedAsChecked}
+                        >
+                          <Check size={14} />通过检查
+                        </button>
                       </div>
                     </div>
                     <div className="segment-toolbar">
@@ -3981,6 +4389,16 @@ function AppContent(){
                               setSelectedSegId(segment.id)
                               seek(segment.start, { preserveFilteredPlayback: true })
                             }}
+                            onContextMenu={(event) => {
+                              if ((event.target as HTMLElement).closest('input, textarea, select')) return
+                              event.preventDefault()
+                              openInlineSpeakerPicker(segment, {
+                                left: event.clientX,
+                                right: event.clientX + 1,
+                                top: event.clientY,
+                                bottom: event.clientY + 1,
+                              })
+                            }}
                             onKeyDown={(event) => {
                               if (event.target !== event.currentTarget) return
                               if (event.key !== 'Enter' && event.key !== ' ') return
@@ -3994,10 +4412,30 @@ function AppContent(){
                             <span>{index + 1}</span>
                             <span>{formatHMSms(segment.start)}</span>
                             <span>{formatHMSms(segment.end)}</span>
-                            <span className="dialogue-speaker-cell">
-                              <strong>{speaker?.name || segment.speakerId}</strong>
-                              <small>ID: {segment.speakerId}</small>
-                            </span>
+                            <div className={`dialogue-speaker-cell${revision.hasSpeakerChanged ? ' has-original' : ''}`}>
+                              <button
+                                type="button"
+                                className="dialogue-speaker-edit-trigger"
+                                aria-label={`修改第 ${index + 1} 句说话人`}
+                                title="点击修改说话人；也可以右键整行"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  openInlineSpeakerPicker(segment, event.currentTarget.getBoundingClientRect())
+                                }}
+                              >
+                                <span className="dialogue-speaker-color" style={{ background: speaker?.color || '#64748b' }} />
+                                <span className="dialogue-speaker-label">
+                                  <strong>{speaker?.name || segment.speakerId}</strong>
+                                  <small>ID: {segment.speakerId}</small>
+                                </span>
+                                <Pencil size={12} className="dialogue-speaker-edit-icon" />
+                              </button>
+                              {revision.hasSpeakerChanged && (
+                                <small className="dialogue-original-speaker" title={revision.speakerLine}>
+                                  原：{originalSpeaker?.name || segment.originalSpeakerId}
+                                </small>
+                              )}
+                            </div>
                             <span className="dialogue-status-cell">
                               <span>{status}</span>
                               {revision.badges.length > 0 && (
@@ -4095,6 +4533,116 @@ function AppContent(){
           )}
         </div>
       </div>
+      {inlineSpeakerPicker && inlineSpeakerPickerSegment && (
+        <div
+          ref={inlineSpeakerPickerRef}
+          className="inline-speaker-picker"
+          role="dialog"
+          aria-label={inlineSpeakerPicker.mode === 'add' ? '新增说话人' : '修改当前台词说话人'}
+          style={{ left: inlineSpeakerPicker.x, top: inlineSpeakerPicker.y }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div className="inline-speaker-picker-header">
+            <div>
+              <strong>{inlineSpeakerPicker.mode === 'add' ? '新增或选择说话人' : '修改说话人'}</strong>
+              <small>
+                {formatHMSms(inlineSpeakerPickerSegment.start)} · 当前：
+                {speakers.find((speaker) => speaker.id === inlineSpeakerPickerSegment.speakerId)?.name || inlineSpeakerPickerSegment.speakerId}
+              </small>
+            </div>
+            <button
+              type="button"
+              className="inline-speaker-picker-close"
+              aria-label="关闭说话人选择器"
+              onClick={() => setInlineSpeakerPicker(null)}
+            >
+              <X size={15} />
+            </button>
+          </div>
+          <label className="inline-speaker-search">
+            <Search size={15} />
+            <input
+              autoFocus
+              value={inlineSpeakerPicker.query}
+              onChange={(event) => setInlineSpeakerPicker((current) => current
+                ? { ...current, query: event.target.value }
+                : current)}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing) return
+                const query = inlineSpeakerPicker.query.trim()
+                const hasExactSpeaker = speakers.some((speaker) => speaker.id === query || speaker.name === query)
+                if (event.key === 'Enter' && inlineSpeakerPicker.mode === 'add' && query && !hasExactSpeaker) {
+                  event.preventDefault()
+                  addInlineSpeakerOnly()
+                  return
+                }
+                if (event.key === 'Enter' && inlineSpeakerPickerOptions.length === 1) {
+                  event.preventDefault()
+                  assignSpeakerToSegment(inlineSpeakerPickerSegment.id, inlineSpeakerPickerOptions[0])
+                }
+              }}
+              placeholder={inlineSpeakerPicker.mode === 'add' ? '输入新说话人姓名或搜索已有 ID' : '搜索姓名或说话人 ID'}
+            />
+          </label>
+          <div className="inline-speaker-options">
+            {inlineSpeakerPickerOptions.map((speaker) => {
+              const isCurrent = speaker.id === inlineSpeakerPickerSegment.speakerId
+              const isRecent = recentSpeakerIds.includes(speaker.id)
+              const usageCount = speakerUsageCounts.get(speaker.id) || 0
+              const isManualSpeaker = speaker.source === 'manual'
+              return (
+                <div className="inline-speaker-option-row" key={speaker.id}>
+                  <button
+                    type="button"
+                    className={`inline-speaker-option${isCurrent ? ' current' : ''}`}
+                    onClick={() => assignSpeakerToSegment(inlineSpeakerPickerSegment.id, speaker)}
+                  >
+                    <span className="inline-speaker-option-color" style={{ background: speaker.color }} />
+                    <span>
+                      <strong>{speaker.name}</strong>
+                      <small>{speaker.id}</small>
+                    </span>
+                    {isRecent && <em>最近</em>}
+                    {isCurrent && <Check size={15} />}
+                  </button>
+                  {isManualSpeaker && (
+                    <button
+                      type="button"
+                      className={`inline-speaker-delete${usageCount > 0 ? ' blocked' : ''}`}
+                      title={usageCount > 0
+                        ? `已有 ${usageCount} 个片段使用该说话人，需先改为其他说话人`
+                        : `删除人工新增说话人 ${speaker.name}`}
+                      aria-label={`删除人工新增说话人 ${speaker.name}`}
+                      onClick={() => removeManualSpeaker(speaker)}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+            {inlineSpeakerPickerOptions.length === 0 && (
+              <div className="inline-speaker-empty">没有匹配的说话人</div>
+            )}
+          </div>
+          {inlineSpeakerPicker.query.trim() && !speakers.some((speaker) => (
+            speaker.id === inlineSpeakerPicker.query.trim() || speaker.name === inlineSpeakerPicker.query.trim()
+          )) && (
+            <div className="inline-speaker-add-actions">
+              <button type="button" className="inline-speaker-add" onClick={addInlineSpeakerOnly}>
+                <Plus size={15} />
+                仅新增“{inlineSpeakerPicker.query.trim()}”
+              </button>
+              <button type="button" className="inline-speaker-add primary" onClick={addInlineSpeakerAndAssign}>
+                新增并用于当前
+              </button>
+            </div>
+          )}
+          <div className="inline-speaker-picker-hint">
+            单击已有说话人会立即应用并标记 corrected · 只有人工新增且未使用的说话人可删除
+          </div>
+        </div>
+      )}
       {/* Delete confirmation modal */}
       {confirmDelete?.open && (
         <div className="modal-backdrop" onClick={()=> setConfirmDelete(null)}>

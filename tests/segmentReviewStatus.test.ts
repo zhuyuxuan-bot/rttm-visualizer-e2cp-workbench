@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { getReviewStatusAfterSegmentPatch } from '../src/segmentReviewStatus.ts'
+import {
+  getReviewStatusAfterPass,
+  getReviewStatusAfterSegmentPatch,
+} from '../src/segmentReviewStatus.ts'
 
 test('changing speaker automatically marks a checked segment as corrected', () => {
   assert.equal(
@@ -30,4 +33,15 @@ test('saving unchanged text keeps the existing review status', () => {
     ),
     'checked',
   )
+})
+
+test('passing a pending segment marks it checked', () => {
+  assert.equal(getReviewStatusAfterPass('pending'), 'checked')
+  assert.equal(getReviewStatusAfterPass(undefined), 'checked')
+})
+
+test('passing preserves meaningful non-pending review states', () => {
+  for (const status of ['checked', 'corrected', 'inserted', 'deleted', 'uncertain'] as const) {
+    assert.equal(getReviewStatusAfterPass(status), status)
+  }
 })
