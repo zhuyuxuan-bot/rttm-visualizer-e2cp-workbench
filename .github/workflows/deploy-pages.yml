@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - codex/rttm-annotation-tool
   workflow_dispatch:
 
 permissions:
