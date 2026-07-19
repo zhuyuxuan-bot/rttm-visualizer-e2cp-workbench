@@ -673,6 +673,26 @@ body {
   text-overflow: ellipsis;
   font-size: 12px;
 }
+.subtitle-chip.manual-insert {
+  z-index: 2;
+  border-color: rgba(45, 212, 191, 0.72);
+  background: rgba(13, 148, 136, 0.3);
+  color: #ccfbf1;
+}
+.subtitle-chip.manual-insert .subtitle-chip-index {
+  color: #5eead4;
+}
+.subtitle-chip.manual-insert:hover,
+.subtitle-chip.manual-insert.active,
+.subtitle-chip.manual-insert.selected {
+  border-color: rgba(94, 234, 212, 0.98);
+  background: rgba(20, 184, 166, 0.48);
+  box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.32), 0 8px 20px rgba(13, 148, 136, 0.18);
+}
+.subtitle-chip.manual-insert.selected {
+  outline: 2px solid rgba(96, 165, 250, 0.95);
+  outline-offset: 1px;
+}
 
 .playhead { position:absolute; top:0; bottom:0; width:2px; background: var(--danger); pointer-events:none; z-index: 6; box-shadow: 0 0 0 1px rgba(254,202,202,0.35), 0 0 12px rgba(239,68,68,0.45); }
 .time-probe {
@@ -720,6 +740,10 @@ body {
 
 /* Long playhead spanning speaker tracks area */
 .tracks { position: relative; display: flex; flex-direction: column; min-height: 0; }
+.speaker-tracks-viewport {
+  width: 100%;
+  overscroll-behavior-x: none;
+}
 .der-overlay { position: absolute; left:0; right:0; top:0; bottom:0; pointer-events: none; }
 .der-overlay .der-chunk { position:absolute; top:0; bottom:0; border-radius:4px; transform-origin: center; transition: transform .12s ease, opacity .12s ease; }
 .der-overlay .der-chunk:hover { transform: translateY(-1px); opacity: 0.3; }

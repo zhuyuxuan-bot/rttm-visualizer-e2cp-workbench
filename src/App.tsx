@@ -14,6 +14,7 @@ import { stripSpeakerPrefix } from './dialogueText'
 import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
 import {
   buildSegmentRevisionSummary,
+  isManualInsertedSegment,
   normalizeOriginalSpeakerFields,
   preserveOriginalSegmentFields,
 } from './segmentAudit'
@@ -900,6 +901,12 @@ function AppContent(){
     const rawText = segment.text?.trim() || subtitle?.text || ''
     return stripSpeakerPrefix(rawText, speakerTextLabels)
   }, [allSubtitles, speakerTextLabels])
+  const manualTimelineSubtitles = useMemo(() => {
+    return segments
+      .filter((segment) => isManualInsertedSegment(segment) && segment.reviewStatus !== 'deleted')
+      .slice()
+      .sort((left, right) => left.start - right.start)
+  }, [segments])
   const reviewDisplaySegments = useMemo<ReviewDisplaySegment[]>(() => {
     const speakerById = new Map(speakers.map((speaker) => [speaker.id, speaker]))
     return segments
@@ -3682,6 +3689,30 @@ function AppContent(){
                       </button>
                     )
                   })}
+                  {manualTimelineSubtitles.map((segment) => {
+                    const left = segment.start * pxPerSec
+                    const width = Math.max(18, (segment.end - segment.start) * pxPerSec)
+                    const isActive = currentTime >= segment.start && currentTime < segment.end
+                    const isSelected = selectedSegId === segment.id
+                    const text = getSegmentDisplayText(segment) || '待补台词'
+                    return (
+                      <button
+                        key={`manual-subtitle-${segment.id}`}
+                        className={`subtitle-chip manual-insert${isActive ? ' active' : ''}${isSelected ? ' selected' : ''}`}
+                        style={{left, width}}
+                        title={`人工补句 ${formatHMSms(segment.start)} - ${formatHMSms(segment.end)} ${text}`}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setSelectedSegId(segment.id)
+                          seek(segment.start)
+                        }}
+                        onPointerDown={(event) => event.stopPropagation()}
+                      >
+                        <span className="subtitle-chip-index">补</span>
+                        <span className="subtitle-chip-text">{text}</span>
+                      </button>
+                    )
+                  })}
                 </div>
               )}
 
@@ -3699,11 +3730,19 @@ function AppContent(){
                 {/* 可滚动的轨道容器 */}
                 <div
                   ref={speakerTracksViewportRef}
+                  className="speaker-tracks-viewport"
+                  onScroll={(event) => {
+                    // The outer timeline owns horizontal scrolling. Keeping this
+                    // nested viewport at x=0 preserves the shared time origin.
+                    if (event.currentTarget.scrollLeft !== 0) {
+                      event.currentTarget.scrollLeft = 0
+                    }
+                  }}
                   style={{
                     flex: 'none',
                     height: '100%',
                     overflowY: 'auto',
-                    paddingRight: '8px',
+                    overflowX: 'hidden',
                   }}
                 >
                   {allTracks.map(spk => {
