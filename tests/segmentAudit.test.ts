@@ -113,3 +113,57 @@ test('buildSegmentRevisionSummary stays quiet when current values match original
   assert.equal(summary.hasTextChanged, false)
   assert.deepEqual(summary.badges, [])
 })
+
+test('manual inserted segments never acquire original speaker or text values', () => {
+  const result = preserveOriginalSegmentFields(
+    {
+      id: 'inserted-1',
+      speakerId: 'A',
+      text: '手工漏句',
+      origin: 'manual_insert',
+      reviewStatus: 'inserted',
+    },
+    { speakerId: 'B', text: '修正后的手工漏句' },
+    '手工漏句',
+  )
+
+  assert.equal(result.origin, 'manual_insert')
+  assert.equal(result.sourceSpeakerId, undefined)
+  assert.equal(result.originalSpeakerId, undefined)
+  assert.equal(result.originalText, undefined)
+})
+
+test('normalization repairs stale audit fields on an old manual inserted draft', () => {
+  const result = normalizeOriginalSpeakerFields({
+    id: 'inserted-1',
+    speakerId: 'B',
+    sourceSpeakerId: 'A',
+    originalSpeakerId: 'A',
+    originalText: '旧值',
+    reviewStatus: 'corrected',
+    notes: 'Manual inserted missing dialogue',
+    evidence: { waveform: { suspectedMissing: true } },
+  })
+
+  assert.equal(result.origin, 'manual_insert')
+  assert.equal(result.reviewStatus, 'inserted')
+  assert.equal(result.sourceSpeakerId, undefined)
+  assert.equal(result.originalSpeakerId, undefined)
+  assert.equal(result.originalText, undefined)
+})
+
+test('manual inserted segments do not show original-value revision badges', () => {
+  const summary = buildSegmentRevisionSummary({
+    id: 'inserted-1',
+    speakerId: 'B',
+    originalSpeakerId: 'A',
+    originalText: '旧值',
+    text: '新值',
+    origin: 'manual_insert',
+    reviewStatus: 'inserted',
+  })
+
+  assert.equal(summary.hasSpeakerChanged, false)
+  assert.equal(summary.hasTextChanged, false)
+  assert.deepEqual(summary.badges, [])
+})

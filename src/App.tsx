@@ -109,6 +109,7 @@ interface Segment {
   start: number
   end: number
   text?: string
+  origin?: 'rttm' | 'manual_insert'
   sourceSpeakerId?: string
   originalSpeakerId?: string
   originalText?: string
@@ -274,25 +275,38 @@ function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
       if (startMs === undefined || endMs === undefined) return acc
       const evidence = asRecord(record.evidence) as SegmentEvidence | null
       const original = asRecord(record.original)
-      const sourceSpeakerId = evidence?.audio?.rttmSpeaker
+      const notes = pickString(record, ['notes']) || ''
+      const reviewStatus = isReviewStatusValue(record.review_status) ? record.review_status : 'pending'
+      const origin = record.origin === 'manual_insert' ||
+        reviewStatus === 'inserted' ||
+        (evidence?.waveform?.suspectedMissing && !evidence?.audio?.rttmSpeaker) ||
+        /manual inserted|inserted from waveform/i.test(notes)
+          ? 'manual_insert'
+          : 'rttm'
+      const sourceSpeakerId = origin === 'manual_insert' ? undefined : evidence?.audio?.rttmSpeaker
       const importedOriginalSpeakerId =
-        pickString(original || {}, ['speaker_id', 'speakerId']) ||
-        pickString(record, ['original_speaker_id', 'originalSpeakerId'])
+        origin === 'manual_insert'
+          ? undefined
+          : pickString(original || {}, ['speaker_id', 'speakerId']) ||
+            pickString(record, ['original_speaker_id', 'originalSpeakerId'])
       acc.push({
         id: pickString(record, ['id']) || `project_${index + 1}_${startMs}_${endMs}`,
         speakerId,
         start: startMs / 1000,
         end: Math.max(startMs / 1000 + 0.001, endMs / 1000),
         text: pickString(record, ['text']) || evidence?.text?.value || '',
+        origin,
         sourceSpeakerId: sourceSpeakerId || importedOriginalSpeakerId,
         originalSpeakerId: sourceSpeakerId || importedOriginalSpeakerId,
         originalText:
-          pickOptionalString(original, ['text']) ??
-          pickOptionalString(record, ['original_text', 'originalText']),
-        reviewStatus: isReviewStatusValue(record.review_status) ? record.review_status : 'pending',
+          origin === 'manual_insert'
+            ? undefined
+            : pickOptionalString(original, ['text']) ??
+              pickOptionalString(record, ['original_text', 'originalText']),
+        reviewStatus: origin === 'manual_insert' && reviewStatus !== 'deleted' ? 'inserted' : reviewStatus,
         segmentType: isSegmentTypeValue(record.segment_type) ? record.segment_type : 'dialogue',
         evidence: evidence || undefined,
-        notes: pickString(record, ['notes']) || '',
+        notes,
       })
       return acc
     }, [])
@@ -515,6 +529,7 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
       start,
       end,
       text: '',
+      origin: 'rttm',
       reviewStatus: 'pending',
       segmentType: 'dialogue',
       evidence: {
@@ -1154,7 +1169,10 @@ function AppContent(){
           text: proposal.text,
           start: proposal.start_ms / 1000,
           end: proposal.end_ms / 1000,
-          reviewStatus: 'corrected',
+          reviewStatus: getReviewStatusAfterSegmentPatch(currentSegment, {
+            speakerId: proposal.speaker_id,
+            text: proposal.text,
+          }),
         }
         return {
           ...segment,
@@ -1988,6 +2006,7 @@ function AppContent(){
     }
     const previousSnapshot = cloneSegments([previousSegment])[0]
     const previousSpeaker = speakersRef.current.find((item) => item.id === previousSegment.speakerId)
+    const nextReviewStatus = getReviewStatusAfterSegmentPatch(previousSegment, { speakerId: speaker.id })
     setSegments((currentSegments) => currentSegments.map((segment) => {
       if (segment.id !== segmentId) return segment
       const patch: Partial<Segment> = {
@@ -1998,14 +2017,14 @@ function AppContent(){
         ...segment,
         ...preserveOriginalSegmentFields(segment, patch, getSegmentDisplayText(segment)),
         ...patch,
-        reviewStatus: getReviewStatusAfterSegmentPatch(segment, patch),
+        reviewStatus: nextReviewStatus,
         evidence: { ...segment.evidence, ...patch.evidence },
       }
     }))
     setRecentSpeakerIds((current) => updateRecentSpeakerIds(current, speaker.id))
     setInlineSpeakerPicker(null)
     const speakerChangeToast = {
-      message: `说话人已由“${previousSpeaker?.name || previousSegment.speakerId}”改为“${speaker.name}”，状态已标记为 corrected`,
+      message: `说话人已由“${previousSpeaker?.name || previousSegment.speakerId}”改为“${speaker.name}”，${nextReviewStatus === 'inserted' ? '人工漏句状态保持为 inserted' : `状态已标记为 ${nextReviewStatus}`}`,
       actionLabel: '撤销',
       onAction: () => {
         setSegments((currentSegments) => currentSegments.map((segment) => (
@@ -2638,6 +2657,7 @@ function AppContent(){
       start: baseStart,
       end: baseEnd,
       text: '',
+      origin: 'manual_insert',
       reviewStatus: 'inserted',
       segmentType: 'dialogue',
       evidence: { text: { source: 'manual', value: '' } },
@@ -4661,7 +4681,7 @@ function AppContent(){
             </div>
           )}
           <div className="inline-speaker-picker-hint">
-            单击已有说话人会立即应用并标记 corrected · 只有人工新增且未使用的说话人可删除
+            单击已有说话人会立即应用；人工漏句保持 inserted，其他修改标记 corrected · 只有人工新增且未使用的说话人可删除
           </div>
         </div>
       )}

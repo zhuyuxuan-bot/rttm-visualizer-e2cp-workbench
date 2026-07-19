@@ -13,6 +13,8 @@ export type SegmentType =
   | 'ad'
   | 'unknown'
 
+export type SegmentOrigin = 'rttm' | 'manual_insert'
+
 export type ModalityAvailability = 'present' | 'missing' | 'not_applicable'
 
 export interface SegmentEvidence {
@@ -49,6 +51,7 @@ export interface ReviewSegment {
   speaker_id: string
   speaker_name: string
   text: string
+  origin?: SegmentOrigin
   original?: {
     speaker_id?: string
     speaker_name?: string
@@ -117,6 +120,7 @@ export function buildEpisodeProject(input: {
     start: number
     end: number
     text?: string
+    origin?: SegmentOrigin
     originalSpeakerId?: string
     originalText?: string
     reviewStatus?: ReviewStatus
@@ -137,6 +141,7 @@ export function buildEpisodeProject(input: {
     const speaker = speakerById.get(segment.speakerId)
     const originalSpeaker = segment.originalSpeakerId ? speakerById.get(segment.originalSpeakerId) : undefined
     const text = segment.text ?? segment.evidence?.text?.value ?? ''
+    const origin = segment.origin ?? (segment.reviewStatus === 'inserted' ? 'manual_insert' : 'rttm')
     return {
       id: segment.id,
       index: index + 1,
@@ -145,7 +150,8 @@ export function buildEpisodeProject(input: {
       speaker_id: segment.speakerId,
       speaker_name: speaker?.name ?? segment.speakerId,
       text,
-      original: segment.originalSpeakerId || segment.originalText !== undefined
+      origin,
+      original: origin !== 'manual_insert' && (segment.originalSpeakerId || segment.originalText !== undefined)
         ? {
             speaker_id: segment.originalSpeakerId,
             speaker_name: originalSpeaker?.name ?? segment.originalSpeakerId,
@@ -170,6 +176,7 @@ export function buildEpisodeProject(input: {
     speaker_id: segment.speakerId,
     speaker_name: segment.speakerId,
     text: '',
+    origin: 'rttm',
     segment_type: 'dialogue',
     review_status: 'pending',
     evidence: { audio: { rttmSpeaker: segment.speakerId } },
