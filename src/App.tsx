@@ -12,7 +12,11 @@ import { filterDialogueRows } from './dialogueFilters'
 import { getFilteredPlaybackSessionAfterSeek, getFilteredPlaybackStep } from './filteredPlaybackQueue'
 import { stripSpeakerPrefix } from './dialogueText'
 import { shouldSuppressGlobalShortcut } from './keyboardShortcuts'
-import { buildSegmentRevisionSummary, preserveOriginalSegmentFields } from './segmentAudit'
+import {
+  buildSegmentRevisionSummary,
+  normalizeOriginalSpeakerFields,
+  preserveOriginalSegmentFields,
+} from './segmentAudit'
 import { getReviewStatusAfterPass, getReviewStatusAfterSegmentPatch } from './segmentReviewStatus'
 import { getSpeakerPickerPosition, orderSpeakerPickerOptions, updateRecentSpeakerIds } from './speakerPicker'
 import { ReviewWorkbench, type ReviewActionRequest, type ReviewDisplaySegment } from './ReviewWorkbench'
@@ -105,6 +109,7 @@ interface Segment {
   start: number
   end: number
   text?: string
+  sourceSpeakerId?: string
   originalSpeakerId?: string
   originalText?: string
   reviewStatus?: ReviewStatus
@@ -187,6 +192,14 @@ function cloneSegments(segments: Segment[]): Segment[] {
   }))
 }
 
+function normalizeSegmentOriginalSpeaker(segment: Segment): Segment {
+  return normalizeOriginalSpeakerFields(segment, segment.evidence?.audio?.rttmSpeaker)
+}
+
+function normalizeSegmentOriginalSpeakers(segments: Segment[]): Segment[] {
+  return segments.map(normalizeSegmentOriginalSpeaker)
+}
+
 function cloneSpeakers(speakers: Speaker[]): Speaker[] {
   return speakers.map((speaker) => ({ ...speaker }))
 }
@@ -205,7 +218,11 @@ function annotationSnapshotSignature(snapshot: AnnotationSnapshot): string {
 function parseDraftPayload(raw: string | null): DraftPayload | null {
   if (!raw) return null
   const payload = JSON.parse(raw) as DraftPayload
-  return payload.schemaVersion === DRAFT_SCHEMA_VERSION ? payload : null
+  if (payload.schemaVersion !== DRAFT_SCHEMA_VERSION) return null
+  return {
+    ...payload,
+    segments: normalizeSegmentOriginalSpeakers(payload.segments),
+  }
 }
 
 function isReviewStatusValue(value: unknown): value is ReviewStatus {
@@ -257,15 +274,18 @@ function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
       if (startMs === undefined || endMs === undefined) return acc
       const evidence = asRecord(record.evidence) as SegmentEvidence | null
       const original = asRecord(record.original)
+      const sourceSpeakerId = evidence?.audio?.rttmSpeaker
+      const importedOriginalSpeakerId =
+        pickString(original || {}, ['speaker_id', 'speakerId']) ||
+        pickString(record, ['original_speaker_id', 'originalSpeakerId'])
       acc.push({
         id: pickString(record, ['id']) || `project_${index + 1}_${startMs}_${endMs}`,
         speakerId,
         start: startMs / 1000,
         end: Math.max(startMs / 1000 + 0.001, endMs / 1000),
         text: pickString(record, ['text']) || evidence?.text?.value || '',
-        originalSpeakerId:
-          pickString(original || {}, ['speaker_id', 'speakerId']) ||
-          pickString(record, ['original_speaker_id', 'originalSpeakerId']),
+        sourceSpeakerId: sourceSpeakerId || importedOriginalSpeakerId,
+        originalSpeakerId: sourceSpeakerId || importedOriginalSpeakerId,
         originalText:
           pickOptionalString(original, ['text']) ??
           pickOptionalString(record, ['original_text', 'originalText']),
@@ -490,6 +510,8 @@ function parseRTTM(text:string): {segments:Segment[], speakers:Speaker[]} {
     segs.push({
       id,
       speakerId: spk,
+      sourceSpeakerId: spk,
+      originalSpeakerId: spk,
       start,
       end,
       text: '',
@@ -1267,7 +1289,7 @@ function AppContent(){
   }, [])
 
   const restoreAnnotationSnapshot = useCallback((snapshot: AnnotationSnapshot) => {
-    const restored = buildAnnotationSnapshot(snapshot.segments, snapshot.speakers)
+    const restored = buildAnnotationSnapshot(normalizeSegmentOriginalSpeakers(snapshot.segments), snapshot.speakers)
     const signature = annotationSnapshotSignature(restored)
     historySkipRef.current = true
     lastHistorySignatureRef.current = signature

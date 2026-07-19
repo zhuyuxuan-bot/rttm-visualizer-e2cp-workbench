@@ -2,6 +2,7 @@ export interface AuditableSegment {
   id: string
   speakerId: string
   text?: string
+  sourceSpeakerId?: string
   originalSpeakerId?: string
   originalText?: string
 }
@@ -12,6 +13,20 @@ export interface SegmentRevisionSummary {
   badges: string[]
   speakerLine?: string
   textLine?: string
+}
+
+export function normalizeOriginalSpeakerFields<TSegment extends AuditableSegment>(
+  segment: TSegment,
+  importedSpeakerId?: string,
+): TSegment {
+  const sourceSpeakerId = importedSpeakerId || segment.sourceSpeakerId
+  if (!sourceSpeakerId) return segment
+  if (segment.sourceSpeakerId === sourceSpeakerId && segment.originalSpeakerId === sourceSpeakerId) return segment
+  return {
+    ...segment,
+    sourceSpeakerId,
+    originalSpeakerId: sourceSpeakerId,
+  }
 }
 
 function normalizeText(value?: string): string {
@@ -28,7 +43,7 @@ export function preserveOriginalSegmentFields<TSegment extends AuditableSegment>
   const textWillChange = patch.text !== undefined && normalizeText(patch.text) !== normalizeText(currentText ?? segment.text)
 
   if (speakerWillChange && !segment.originalSpeakerId) {
-    next.originalSpeakerId = segment.speakerId
+    next.originalSpeakerId = segment.sourceSpeakerId || segment.speakerId
   }
 
   if ((speakerWillChange || textWillChange) && segment.originalText === undefined) {
@@ -46,7 +61,7 @@ export function buildSegmentRevisionSummary(
     currentText?: string
   } = {},
 ): SegmentRevisionSummary {
-  const originalSpeaker = segment.originalSpeakerId
+  const originalSpeaker = segment.sourceSpeakerId || segment.originalSpeakerId
   const currentSpeaker = segment.speakerId
   const originalText = segment.originalText
   const currentText = labels.currentText ?? segment.text ?? ''
