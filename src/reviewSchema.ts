@@ -6,6 +6,8 @@ export type ReviewStatus =
   | 'deleted'
   | 'uncertain'
 
+export type RestorableReviewStatus = Exclude<ReviewStatus, 'deleted'>
+
 export type SegmentType =
   | 'dialogue'
   | 'subtitle'
@@ -59,6 +61,7 @@ export interface ReviewSegment {
   }
   segment_type: SegmentType
   review_status: ReviewStatus
+  review_status_before_delete?: RestorableReviewStatus
   evidence: SegmentEvidence
   notes: string
 }
@@ -124,6 +127,7 @@ export function buildEpisodeProject(input: {
     originalSpeakerId?: string
     originalText?: string
     reviewStatus?: ReviewStatus
+    reviewStatusBeforeDelete?: RestorableReviewStatus
     notes?: string
     segmentType?: SegmentType
     evidence?: SegmentEvidence
@@ -160,6 +164,9 @@ export function buildEpisodeProject(input: {
         : undefined,
       segment_type: segment.segmentType ?? 'dialogue',
       review_status: segment.reviewStatus ?? 'pending',
+      review_status_before_delete: segment.reviewStatus === 'deleted'
+        ? segment.reviewStatusBeforeDelete
+        : undefined,
       evidence: {
         ...segment.evidence,
         text: segment.evidence?.text ?? (text ? { source: 'manual', value: text } : undefined),

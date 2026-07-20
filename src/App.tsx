@@ -19,6 +19,7 @@ import {
   preserveOriginalSegmentFields,
 } from './segmentAudit'
 import { getReviewStatusAfterPass, getReviewStatusAfterSegmentPatch } from './segmentReviewStatus'
+import { toggleDeletedReviewStatus, type RestorableReviewStatus } from './segmentDeleteStatus'
 import { getSpeakerPickerPosition, orderSpeakerPickerOptions, updateRecentSpeakerIds } from './speakerPicker'
 import { ReviewWorkbench, type ReviewActionRequest, type ReviewDisplaySegment } from './ReviewWorkbench'
 import {
@@ -115,6 +116,7 @@ interface Segment {
   originalSpeakerId?: string
   originalText?: string
   reviewStatus?: ReviewStatus
+  reviewStatusBeforeDelete?: RestorableReviewStatus
   notes?: string
   segmentType?: SegmentType
   evidence?: SegmentEvidence
@@ -278,6 +280,9 @@ function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
       const original = asRecord(record.original)
       const notes = pickString(record, ['notes']) || ''
       const reviewStatus = isReviewStatusValue(record.review_status) ? record.review_status : 'pending'
+      const reviewStatusBeforeDelete = isReviewStatusValue(record.review_status_before_delete) && record.review_status_before_delete !== 'deleted'
+        ? record.review_status_before_delete
+        : undefined
       const origin = record.origin === 'manual_insert' ||
         reviewStatus === 'inserted' ||
         (evidence?.waveform?.suspectedMissing && !evidence?.audio?.rttmSpeaker) ||
@@ -305,6 +310,7 @@ function parseReviewProjectSnapshot(raw: string): DraftPayload | null {
             : pickOptionalString(original, ['text']) ??
               pickOptionalString(record, ['original_text', 'originalText']),
         reviewStatus: origin === 'manual_insert' && reviewStatus !== 'deleted' ? 'inserted' : reviewStatus,
+        reviewStatusBeforeDelete: reviewStatus === 'deleted' ? reviewStatusBeforeDelete : undefined,
         segmentType: isSegmentTypeValue(record.segment_type) ? record.segment_type : 'dialogue',
         evidence: evidence || undefined,
         notes,
@@ -2086,6 +2092,31 @@ function AppContent(){
     )))
     setToast({ message: `已将 ${targetIds.size} 条 pending 标记为 checked` })
     window.setTimeout(() => setToast(null), 3200)
+  }
+  const toggleSegmentDeletedFromDialogueList = (segmentId: string) => {
+    const previousSegment = segmentsRef.current.find((segment) => segment.id === segmentId)
+    if (!previousSegment) return
+    const previousSnapshot = cloneSegments([previousSegment])[0]
+    const nextSegment = toggleDeletedReviewStatus(previousSegment)
+    setSegments((current) => current.map((segment) => (
+      segment.id === segmentId ? nextSegment : segment
+    )))
+    const deletionToast = {
+      message: nextSegment.reviewStatus === 'deleted'
+        ? '已标记为 deleted；再次右键该状态可恢复'
+        : `已恢复为 ${nextSegment.reviewStatus}`,
+      actionLabel: '撤销',
+      onAction: () => {
+        setSegments((current) => current.map((segment) => (
+          segment.id === segmentId ? previousSnapshot : segment
+        )))
+        setToast(null)
+      },
+    }
+    setToast(deletionToast)
+    window.setTimeout(() => {
+      setToast((current) => current === deletionToast ? null : current)
+    }, 5000)
   }
   const onTimeUpdate = () => {
     const el = videoRef.current; if(!el) return
@@ -4517,7 +4548,18 @@ function AppContent(){
                                 </small>
                               )}
                             </div>
-                            <span className="dialogue-status-cell">
+                            <span
+                              className="dialogue-status-cell"
+                              role="button"
+                              tabIndex={0}
+                              aria-label={`第 ${index + 1} 句状态 ${status}；右键${status === 'deleted' ? '恢复删除前状态' : '标记为 deleted'}`}
+                              title={status === 'deleted' ? '右键恢复删除前状态' : '右键标记为 deleted'}
+                              onContextMenu={(event) => {
+                                event.preventDefault()
+                                event.stopPropagation()
+                                toggleSegmentDeletedFromDialogueList(segment.id)
+                              }}
+                            >
                               <span>{status}</span>
                               {revision.badges.length > 0 && (
                                 <small>{revision.badges.join(' / ')}</small>
